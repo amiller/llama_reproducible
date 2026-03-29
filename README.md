@@ -6,11 +6,20 @@ You run a model all day. Occasionally it says something wild — hilarious, prof
 
 ## How it works
 
-LLMs with temperature sampling are stochastic — a seed determines which path through the probability space you take. But normally, GPU and CPU produce *different* outputs for the same seed because floating-point arithmetic differs at the bit level between CUDA and x86.
+LLM text generation is **pseudorandom** — at each step the model produces a probability distribution over tokens, and a [PRNG](https://en.wikipedia.org/wiki/Pseudorandom_number_generator) seeded by a fixed integer decides which token gets sampled. Same seed, same sequence of random choices, same output text. The model weights and the seed together determine a specific trajectory through the space of possible completions.
 
-This project patches [llama.cpp](https://github.com/ggml-org/llama.cpp) to make GPU and CPU inference **bitwise identical**. Every intermediate tensor — all 2462 across 36 transformer layers — matches exactly. The same `(model, seed, prompt, temperature)` produces the same tokens whether you run it on a fast GPU or a slow laptop.
+The problem: this only works if the model produces the **exact same probability distribution** on every machine. In practice, GPU and CPU produce different distributions for the same input because [floating-point arithmetic](https://docs.oracle.com/cd/E19957-01/806-3568/ncg_goldberg.html) differs at the bit level between CUDA and x86. A ±1 difference in the last bit of a 32-bit float compounds through 36 transformer layers until the outputs diverge completely.
+
+This project patches [llama.cpp](https://github.com/ggml-org/llama.cpp) to make GPU and CPU inference **bitwise identical** — every intermediate tensor (all 2462 of them) matches exactly. The same `(model, seed, prompt, temperature)` produces the same tokens whether you run it on a fast GPU or a slow laptop.
 
 A seed becomes a tiny pointer into the space of everything a model could say. The model itself is the shared codebook.
+
+### Related work
+
+- [NVIDIA deterministic computing](https://docs.nvidia.com/cuda/cublas/index.html#results-reproducibility) — same GPU → same results across runs. We go further: GPU ↔ CPU parity.
+- [What Every Computer Scientist Should Know About Floating-Point Arithmetic](https://docs.oracle.com/cd/E19957-01/806-3568/ncg_goldberg.html) — why `a*b+c` on two different chips can give different bits.
+- [IEEE 754 FMA](https://en.wikipedia.org/wiki/Multiply%E2%80%93accumulate_operation#Fused_multiply%E2%80%93add) — the fused multiply-add instruction at the heart of most divergences.
+- [Verifiable ML / ZKML](https://blog.ezkl.xyz/post/verify/) — cryptographic proofs of inference. Heavier machinery solving a different problem; we use simple reproducibility.
 
 ## Try it
 
