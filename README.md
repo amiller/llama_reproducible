@@ -68,25 +68,40 @@ verify.sh       Replay a seed
 docs/           Investigation notes, evidence, GPU setup guide
 ```
 
+## Background: deterministic ≠ portable
+
+llama.cpp already has a [`--deterministic` mode](https://github.com/ggml-org/llama.cpp) (our patches build on top of [this work](https://github.com/ggml-org/llama.cpp/tree/deterministic)). It guarantees **GPU-to-GPU reproducibility** — the same GPU with the same driver produces the same output across runs. This is useful but doesn't help if you want to replay a seed on a different machine.
+
+**Portable reproducibility** — getting a CPU to match a specific GPU — is a harder problem. The GPU is the fast "daily driver" that generates output at ~200 tok/s. The CPU is the slow "shadow" (~2 tok/s) that anyone can run to replay the same seed. The goal is not to make the CPU fast, just to make it agree.
+
+## Design constraints
+
+- **GPU stays fast.** We don't cripple the GPU kernel. Most fixes are on the CPU side, making it emulate the GPU's arithmetic. The few GPU-side changes (`__frsqrt_rn` instead of approximate `rsqrtf`, portable `expf_det` in SiLU) cost ~3-5% overhead.
+- **Specific environment.** We targeted one setup: **RTX 3090 (SM86) + CUDA 12.8**. Different GPUs or CUDA versions may produce different reference outputs — the JIT compiler generates different machine code per architecture. Extending to other GPUs means re-verifying (and possibly re-tuning) the CPU shadow.
+- **One quant format.** Verified for Q4_K_M (the most common GGUF quantization). Other formats need additional work.
+
 ## What had to be fixed
 
-18 separate fixes across the GPU and CPU codepaths. The short version: every math function on a GPU (`expf`, `sinf`, `cosf`, `powf`, `rsqrtf`) produces slightly different bits than the same function on a CPU. Every compiler (NVCC vs GCC) makes different decisions about when to fuse `a*b+c` into a single instruction. The GPU's quantization code rounds differently than the CPU's x86 SIMD version. The attention mechanism processes data in a different order.
+The existing `--deterministic` branch handles GPU-to-GPU consistency (disabling fast-math, padding the KV cache, etc.). On top of that, we fixed 18 additional sources of CPU-GPU divergence:
 
-Each of these differences is ±1 in the last bit of a 32-bit float. But they compound through 36 layers of a neural network until the outputs diverge completely.
+**Every GPU math function is wrong** (for portability). CUDA's `expf`, `sinf`, `cosf`, `powf`, `rsqrtf` all use hardware approximations that differ from the CPU's glibc by ±1 in the last bit. We wrote portable polynomial implementations used on both sides.
 
-See [docs/investigation.md](docs/investigation.md) for the full technical story.
+**Compilers fuse arithmetic differently.** NVCC silently turns `a*b+c` into a fused multiply-add (FMA). GCC doesn't unless you give it `-mfma`. We added explicit `fmaf()` calls and traced the GPU's exact fusion pattern using PTX and SASS disassembly.
 
-## GPU setup
+**The CPU's quantization code was silently wrong.** The x86 SIMD version of `quantize_row_q8_1` uses a different rounding method than the GPU. Our fix in the generic code was correct but the x86 override was never being called. This single bug accounted for 34 of 36 layers diverging.
 
-The GPU side generates the "reference" outputs at ~200 tokens/sec. The CPU replays them at ~2 tokens/sec. See [docs/gpu-setup.md](docs/gpu-setup.md) for the exact CUDA/driver/GPU environment used.
+**Attention accumulates in a different order.** The GPU processes key-value positions in parallel tiles with warp-level butterfly reductions. The CPU used sequential online softmax. We rewrote the CPU attention to match the GPU's tile structure exactly.
 
-The CPU replay works on any modern x86 laptop (Intel ~2013+ / AMD ~2012+). The Docker build pins everything for full reproducibility.
+Each individual divergence is ±1 in the last bit of a 32-bit float. But they compound through 36 layers until the outputs diverge completely.
+
+See [docs/investigation.md](docs/investigation.md) for the full technical story, and [docs/gpu-setup.md](docs/gpu-setup.md) for the exact CUDA/driver/GPU environment.
 
 ## Current scope
 
-- Verified for **Q4_K_M** quantization (most common GGUF format)
+- Built on top of the [llama.cpp deterministic branch](https://github.com/ggml-org/llama.cpp/tree/deterministic) (commit `d092e268`)
+- Verified for **Q4_K_M** quantization on **RTX 3090 / CUDA 12.8**
 - Tested with qwen2.5-3b — small enough to run on any machine
-- IQ4_XS and MoE models need additional work (see docs)
+- IQ4_XS, MoE models, and other GPU architectures need additional work
 
 ## License
 
