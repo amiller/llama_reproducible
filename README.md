@@ -14,12 +14,21 @@ This project patches [llama.cpp](https://github.com/ggml-org/llama.cpp) to make 
 
 A seed becomes a tiny pointer into the space of everything a model could say. The model itself is the shared codebook.
 
-### Related work
+### References
 
-- [NVIDIA deterministic computing](https://docs.nvidia.com/cuda/cublas/index.html#results-reproducibility) — same GPU → same results across runs. We go further: GPU ↔ CPU parity.
+Direct lineage:
+- [llama.cpp deterministic PR #16016](https://github.com/ggml-org/llama.cpp/pull/16016) — the GPU-to-GPU determinism work our patches build on top of.
+- [Defeating Nondeterminism in LLM Inference](https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/) (Horace He, Thinking Machines Lab) — identifies batch invariance as the root cause of non-determinism. Inspired the llama.cpp PR.
+
+Floating-point background:
 - [What Every Computer Scientist Should Know About Floating-Point Arithmetic](https://docs.oracle.com/cd/E19957-01/806-3568/ncg_goldberg.html) — why `a*b+c` on two different chips can give different bits.
 - [IEEE 754 FMA](https://en.wikipedia.org/wiki/Multiply%E2%80%93accumulate_operation#Fused_multiply%E2%80%93add) — the fused multiply-add instruction at the heart of most divergences.
-- [Verifiable ML / ZKML](https://blog.ezkl.xyz/post/verify/) — cryptographic proofs of inference. Heavier machinery solving a different problem; we use simple reproducibility.
+
+Verifiable ML / ZKML:
+- [zkLLM: Zero Knowledge Proofs for Large Language Models](https://arxiv.org/abs/2404.16109) — ZK proofs for full LLM inference. Deterministic execution is a prerequisite; our work could serve as a foundation layer.
+- [ZKML: An Optimizing System for ML Inference in Zero-Knowledge Proofs](https://ddkang.github.io/papers/2024/zkml-eurosys.pdf) (Kang et al., EuroSys) — production ZKML compiler.
+- [Survey of ZK-Based Verifiable ML](https://arxiv.org/html/2502.18535v1) — comprehensive survey covering deterministic execution as a prerequisite for verifiable inference.
+- [Ingonyama](https://www.ingonyama.com/blog/unleashing-secure-ai) — GPU-accelerated ZK proofs for ML verification.
 
 ## Try it
 
@@ -47,7 +56,7 @@ docker run --rm -v $(pwd)/models:/models llama-replay \
 
 ## Example seeds
 
-Model: `qwen2.5-3b-instruct-q4_k_m.gguf` — temp 0.7, prompt "Once upon a time"
+Model: [`qwen2.5-3b-instruct-q4_k_m.gguf`](https://huggingface.co/Qwen/Qwen2.5-3B-Instruct-GGUF/resolve/7dabda4d13d513e3e842b20f0d435c732f172cbe/qwen2.5-3b-instruct-q4_k_m.gguf) (SHA256: `626b4a66...`) — temp 0.7, prompt "Once upon a time"
 
 | Seed | Output |
 |------|--------|
@@ -84,13 +93,11 @@ llama.cpp already has a [`--deterministic` mode](https://github.com/ggml-org/lla
 
 The existing `--deterministic` branch handles GPU-to-GPU consistency (disabling fast-math, padding the KV cache, etc.). On top of that, we fixed 18 additional sources of CPU-GPU divergence:
 
-**Every GPU math function is wrong** (for portability). CUDA's `expf`, `sinf`, `cosf`, `powf`, `rsqrtf` all use hardware approximations that differ from the CPU's glibc by ±1 in the last bit. We wrote portable polynomial implementations used on both sides.
+**Portable math functions.** CUDA's `expf`, `sinf`, `cosf`, `powf`, `rsqrtf` all use hardware approximations that differ from the CPU's glibc by ±1 in the last bit. We wrote portable polynomial implementations (`expf_det`, `sincosf_det`, `powf_int_det`) used on both sides. On the GPU these replace only the non-deterministic functions (SiLU activation, RoPE, RMSNorm, attention softmax) — the quantized matmul kernels are untouched. Overhead: **~3-5%** on GPU, unmeasurable on the memory-bound inference kernels.
 
-**Compilers fuse arithmetic differently.** NVCC silently turns `a*b+c` into a fused multiply-add (FMA). GCC doesn't unless you give it `-mfma`. We added explicit `fmaf()` calls and traced the GPU's exact fusion pattern using PTX and SASS disassembly.
+**FMA pattern matching.** NVCC silently turns `a*b+c` into a fused multiply-add. GCC doesn't unless you give it `-mfma`. We traced the GPU's exact fusion decisions using PTX disassembly (`nvcc --ptx`) and SASS disassembly (`cuobjdump --dump-sass`) to match every multiply-add pattern on the CPU.
 
-**The CPU's quantization code was silently wrong.** The x86 SIMD version of `quantize_row_q8_1` uses a different rounding method than the GPU. Our fix in the generic code was correct but the x86 override was never being called. This single bug accounted for 34 of 36 layers diverging.
-
-**Attention accumulates in a different order.** The GPU processes key-value positions in parallel tiles with warp-level butterfly reductions. The CPU used sequential online softmax. We rewrote the CPU attention to match the GPU's tile structure exactly.
+**Attention tile structure.** The GPU processes key-value positions in parallel tiles with warp-level butterfly reductions. The CPU used sequential online softmax. We rewrote the CPU attention to match the GPU's tile structure, including the butterfly reduction order for the softmax denominator.
 
 Each individual divergence is ±1 in the last bit of a 32-bit float. But they compound through 36 layers until the outputs diverge completely.
 
