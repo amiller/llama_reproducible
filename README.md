@@ -53,7 +53,7 @@ docker run --rm -v $(pwd)/models:/models llama-replay \
 
 ## Example seeds
 
-Model: [`qwen2.5-3b-instruct-q4_k_m.gguf`](https://huggingface.co/Qwen/Qwen2.5-3B-Instruct-GGUF/resolve/7dabda4d13d513e3e842b20f0d435c732f172cbe/qwen2.5-3b-instruct-q4_k_m.gguf) (SHA256: `626b4a66...`) — temp 0.7, prompt "Once upon a time"
+Model: [`qwen2.5-3b-instruct-q4_k_m.gguf`](https://huggingface.co/Qwen/Qwen2.5-3B-Instruct-GGUF) (rev [`7dabda4`](https://huggingface.co/Qwen/Qwen2.5-3B-Instruct-GGUF/tree/7dabda4d13d513e3e842b20f0d435c732f172cbe), SHA256: `626b4a6678b86442...`) — temp 0.7, prompt "Once upon a time"
 
 | Seed | Output |
 |------|--------|
