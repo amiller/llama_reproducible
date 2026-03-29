@@ -24,11 +24,8 @@ Floating-point background:
 - [What Every Computer Scientist Should Know About Floating-Point Arithmetic](https://docs.oracle.com/cd/E19957-01/806-3568/ncg_goldberg.html) — why `a*b+c` on two different chips can give different bits.
 - [IEEE 754 FMA](https://en.wikipedia.org/wiki/Multiply%E2%80%93accumulate_operation#Fused_multiply%E2%80%93add) — the fused multiply-add instruction at the heart of most divergences.
 
-Verifiable ML / ZKML:
-- [zkLLM: Zero Knowledge Proofs for Large Language Models](https://arxiv.org/abs/2404.16109) — ZK proofs for full LLM inference. Deterministic execution is a prerequisite; our work could serve as a foundation layer.
-- [ZKML: An Optimizing System for ML Inference in Zero-Knowledge Proofs](https://ddkang.github.io/papers/2024/zkml-eurosys.pdf) (Kang et al., EuroSys) — production ZKML compiler.
-- [Survey of ZK-Based Verifiable ML](https://arxiv.org/html/2502.18535v1) — comprehensive survey covering deterministic execution as a prerequisite for verifiable inference.
-- [Ingonyama](https://www.ingonyama.com/blog/unleashing-secure-ai) — GPU-accelerated ZK proofs for ML verification.
+ZKML (different approach, different tradeoffs):
+- [zkLLM](https://arxiv.org/abs/2404.16109), [ZKML](https://ddkang.github.io/papers/2024/zkml-eurosys.pdf) (Kang et al.), [survey](https://arxiv.org/html/2502.18535v1), [Ingonyama](https://www.ingonyama.com/blog/unleashing-secure-ai) — cryptographic proofs of inference. ZKML lets a verifier check a ~200KB proof without running the model, but the prover must run inference inside a ZK circuit (orders of magnitude slower than native). You have to decide *before* inference that you want a proof. Our approach is the opposite: run your model normally at full speed, and every inference is automatically replayable because determinism is a property of the execution, not something bolted on. Verification costs 30 seconds of CPU time instead of being instant, but recording costs nothing and is always on — like a dashcam's rolling buffer.
 
 ## Try it
 
