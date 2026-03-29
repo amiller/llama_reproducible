@@ -1,5 +1,7 @@
 # llama_reproducible
 
+[![Verify deterministic seeds](https://github.com/amiller/llama_reproducible/actions/workflows/verify.yml/badge.svg)](https://github.com/amiller/llama_reproducible/actions/workflows/verify.yml)
+
 **A dashcam for your local LLM.**
 
 You run a model all day. Occasionally it says something wild — hilarious, profound, eerily specific. Normally you'd screenshot it and move on. With reproducible inference, you just save the seed. Anyone with the same model can replay the exact moment, token for token.
