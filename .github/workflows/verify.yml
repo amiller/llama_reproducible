@@ -34,7 +34,10 @@ jobs:
 
       - name: Build
         if: steps.cache-build.outputs.cache-hit != 'true'
-        run: ./build.sh
+        run: |
+          git config --global user.email "ci@github.com"
+          git config --global user.name "CI"
+          ./build.sh
 
       - name: Verify seed 2024
         run: |
