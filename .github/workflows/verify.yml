@@ -1,9 +1,17 @@
 name: Verify deterministic seeds
 
 on:
+  # Only run when patches or build change — not on README edits
   push:
     branches: [main]
+    paths:
+      - 'patches/**'
+      - 'build.sh'
+      - 'verify.sh'
+      - 'Dockerfile'
+      - '.github/workflows/**'
   pull_request:
+  workflow_dispatch:  # manual trigger
 
 jobs:
   verify:
