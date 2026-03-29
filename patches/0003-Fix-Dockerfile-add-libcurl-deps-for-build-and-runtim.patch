@@ -1,0 +1,33 @@
+From b99f7e41c3a739e4ce407e4b488184caddbe4501 Mon Sep 17 00:00:00 2001
+From: Andrew Miller <soc1024@illinois.edu>
+Date: Sun, 29 Mar 2026 13:17:02 -0400
+Subject: [PATCH 3/3] Fix Dockerfile: add libcurl deps for build and runtime
+
+Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
+---
+ tools/det-diag/Dockerfile | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/tools/det-diag/Dockerfile b/tools/det-diag/Dockerfile
+index 20af61b2..7e7cfda9 100644
+--- a/tools/det-diag/Dockerfile
++++ b/tools/det-diag/Dockerfile
+@@ -1,5 +1,5 @@
+ FROM ubuntu:22.04 AS builder
+-RUN apt-get update && apt-get install -y build-essential cmake git && rm -rf /var/lib/apt/lists/*
++RUN apt-get update && apt-get install -y build-essential cmake git libcurl4-openssl-dev && rm -rf /var/lib/apt/lists/*
+ 
+ COPY . /src
+ WORKDIR /src
+@@ -14,7 +14,7 @@ RUN cmake -B build \
+   && cmake --build build --target llama-det-diag -j$(nproc)
+ 
+ FROM ubuntu:22.04
+-RUN apt-get update && apt-get install -y libgomp1 && rm -rf /var/lib/apt/lists/*
++RUN apt-get update && apt-get install -y libgomp1 libcurl4 && rm -rf /var/lib/apt/lists/*
+ COPY --from=builder /src/build/bin/llama-det-diag /usr/local/bin/
+ COPY --from=builder /src/build/bin/*.so* /usr/local/lib/
+ ENV LD_LIBRARY_PATH=/usr/local/lib
+-- 
+2.34.1
+
