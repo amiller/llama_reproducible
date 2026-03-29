@@ -1,0 +1,55 @@
+name: Verify deterministic seeds
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache model
+        id: cache-model
+        uses: actions/cache@v4
+        with:
+          path: models/qwen2.5-3b-instruct-q4_k_m.gguf
+          key: model-qwen2.5-3b-instruct-q4_k_m
+
+      - name: Download model
+        if: steps.cache-model.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p models
+          wget -q -O models/qwen2.5-3b-instruct-q4_k_m.gguf \
+            "https://huggingface.co/Qwen/Qwen2.5-3B-Instruct-GGUF/resolve/main/qwen2.5-3b-instruct-q4_k_m.gguf"
+
+      - name: Cache llama.cpp build
+        id: cache-build
+        uses: actions/cache@v4
+        with:
+          path: llama.cpp
+          key: llamacpp-${{ hashFiles('build.sh', 'patches/*.patch') }}
+
+      - name: Build
+        if: steps.cache-build.outputs.cache-hit != 'true'
+        run: ./build.sh
+
+      - name: Verify seed 2024
+        run: |
+          output=$(./verify.sh models/qwen2.5-3b-instruct-q4_k_m.gguf 2024 0.7 "Once upon a time" 30)
+          echo "$output"
+          echo "$output" | grep -q "a little mouse used to go to the cinema every Saturday"
+
+      - name: Verify seed 42
+        run: |
+          output=$(./verify.sh models/qwen2.5-3b-instruct-q4_k_m.gguf 42 0.7 "Once upon a time" 30)
+          echo "$output"
+          echo "$output" | grep -q "there was a boy named Ivan"
+
+      - name: Verify seed 777
+        run: |
+          output=$(./verify.sh models/qwen2.5-3b-instruct-q4_k_m.gguf 777 0.7 "Once upon a time" 30)
+          echo "$output"
+          echo "$output" | grep -q "there was a king who had a problem"
