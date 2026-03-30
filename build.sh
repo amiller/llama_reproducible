@@ -6,11 +6,9 @@ LLAMACPP_COMMIT="7c2036704831dc0363a0cafc6bbb85a6d67c1d90"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 if [ ! -d "$SCRIPT_DIR/llama.cpp" ]; then
-    echo "Cloning llama.cpp..."
-    git clone https://github.com/ggml-org/llama.cpp.git "$SCRIPT_DIR/llama.cpp"
+    echo "Cloning llama.cpp at commit $LLAMACPP_COMMIT..."
+    git clone --filter=blob:none https://github.com/ggml-org/llama.cpp.git "$SCRIPT_DIR/llama.cpp"
     cd "$SCRIPT_DIR/llama.cpp"
-    echo "Checking out commit $LLAMACPP_COMMIT..."
-    git fetch origin "$LLAMACPP_COMMIT" || git fetch --unshallow 2>/dev/null || true
     git checkout "$LLAMACPP_COMMIT"
     echo "Applying deterministic parity patches..."
     git am "$SCRIPT_DIR/patches/"*.patch
