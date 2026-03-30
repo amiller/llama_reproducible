@@ -1,7 +1,6 @@
 name: Verify deterministic seeds
 
 on:
-  # Only run when patches or build change — not on README edits
   push:
     branches: [main]
     paths:
@@ -11,10 +10,11 @@ on:
       - 'Dockerfile'
       - '.github/workflows/**'
   pull_request:
-  workflow_dispatch:  # manual trigger
+  workflow_dispatch:
 
 jobs:
-  verify:
+  verify-qwen25:
+    name: Qwen2.5-3B Q4_K_M (standard transformer)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -67,3 +67,58 @@ jobs:
           output=$(./verify.sh models/qwen2.5-3b-instruct-q4_k_m.gguf 777 0.7 "Once upon a time" 30)
           echo "$output"
           echo "$output" | grep -q "there was a king who had a problem"
+
+  verify-qwen35:
+    name: Qwen3.5-4B IQ4_XS (hybrid Mamba)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache model
+        id: cache-model
+        uses: actions/cache@v4
+        with:
+          path: models/Qwen3.5-4B-IQ4_XS.gguf
+          key: model-qwen35-4b-iq4xs-unsloth
+
+      - name: Download model
+        if: steps.cache-model.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p models
+          wget -q -O models/Qwen3.5-4B-IQ4_XS.gguf \
+            "https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/main/Qwen3.5-4B-IQ4_XS.gguf"
+
+      - name: Cache llama.cpp build
+        id: cache-build
+        uses: actions/cache@v4
+        with:
+          path: llama.cpp
+          key: llamacpp-${{ hashFiles('build.sh', 'patches/*.patch') }}
+
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev
+
+      - name: Build
+        if: steps.cache-build.outputs.cache-hit != 'true'
+        run: |
+          git config --global user.email "ci@github.com"
+          git config --global user.name "CI"
+          ./build.sh
+
+      - name: Verify seed 42
+        run: |
+          output=$(./verify.sh models/Qwen3.5-4B-IQ4_XS.gguf 42 0.7 "Once upon a time" 20)
+          echo "$output"
+          echo "$output" | grep -q "amazing creatures"
+
+      - name: Verify seed 777
+        run: |
+          output=$(./verify.sh models/Qwen3.5-4B-IQ4_XS.gguf 777 0.7 "Once upon a time" 20)
+          echo "$output"
+          echo "$output" | grep -q "amazing science and nature"
+
+      - name: Verify seed 2024
+        run: |
+          output=$(./verify.sh models/Qwen3.5-4B-IQ4_XS.gguf 2024 0.7 "Once upon a time" 20)
+          echo "$output"
+          echo "$output" | grep -q "interesting science"

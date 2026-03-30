@@ -36,12 +36,12 @@ git clone https://github.com/amiller/llama_reproducible.git
 cd llama_reproducible
 ./build.sh
 
-# Download the model (~2GB)
-huggingface-cli download Qwen/Qwen2.5-3B-Instruct-GGUF \
-  qwen2.5-3b-instruct-q4_k_m.gguf --local-dir models/
+# Download a model (~2.3GB)
+wget -O models/Qwen3.5-4B-IQ4_XS.gguf \
+  "https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/main/Qwen3.5-4B-IQ4_XS.gguf"
 
-# Replay a seed
-./verify.sh models/qwen2.5-3b-instruct-q4_k_m.gguf 2024 0.7 "Once upon a time"
+# Replay a seed — same text on any x86 machine
+./verify.sh models/Qwen3.5-4B-IQ4_XS.gguf 42 0.7 "Once upon a time"
 ```
 
 ### Docker (nothing to install)
@@ -49,11 +49,25 @@ huggingface-cli download Qwen/Qwen2.5-3B-Instruct-GGUF \
 ```bash
 docker build -t llama-replay .
 docker run --rm -v $(pwd)/models:/models llama-replay \
-  -m /models/qwen2.5-3b-instruct-q4_k_m.gguf \
-  -p "Once upon a time" -n 30 --seed 2024 --temp 0.7 --deterministic
+  -m /models/Qwen3.5-4B-IQ4_XS.gguf \
+  -p "Once upon a time" -n 30 --seed 42 --temp 0.7 --deterministic
 ```
 
 ## Example seeds
+
+### Qwen3.5-4B (hybrid Mamba/linear-attention)
+
+Model: [`Qwen3.5-4B-IQ4_XS.gguf`](https://huggingface.co/unsloth/Qwen3.5-4B-GGUF) — temp 0.7, prompt "Once upon a time"
+
+| Seed | Output |
+|------|--------|
+| 42 | ", in a world full of amazing creatures, there lived a very special bird called the Northern Flicker" |
+| 777 | ", in a world full of amazing science and nature, there was a very special place called a freshwater" |
+| 2024 | ", in a world full of interesting science, there was a group of young scientists who were on a" |
+
+This model uses a **hybrid architecture** — 75% linear attention (gated delta net + 1D conv) and 25% full attention — making parity significantly harder than standard transformers.
+
+### Qwen2.5-3B (standard transformer)
 
 Model: [`qwen2.5-3b-instruct-q4_k_m.gguf`](https://huggingface.co/Qwen/Qwen2.5-3B-Instruct-GGUF) (rev [`7dabda4`](https://huggingface.co/Qwen/Qwen2.5-3B-Instruct-GGUF/tree/7dabda4d13d513e3e842b20f0d435c732f172cbe), SHA256: `626b4a6678b86442...`) — temp 0.7, prompt "Once upon a time"
 
@@ -69,7 +83,7 @@ Pick a seed, run it on any modern x86 laptop. Same text comes out.
 ## What's inside
 
 ```
-patches/        3 patch files against llama.cpp (commit d092e268)
+patches/        Patch against llama.cpp (commit 7c203670)
 Dockerfile      Pinned build for reproducibility
 build.sh        Clone llama.cpp, apply patches, build
 verify.sh       Replay a seed
@@ -86,7 +100,7 @@ llama.cpp already has a [`--deterministic` mode](https://github.com/ggml-org/lla
 
 - **GPU stays fast.** We don't cripple the GPU kernel. Most fixes are on the CPU side, making it emulate the GPU's arithmetic. The few GPU-side changes (`__frsqrt_rn` instead of approximate `rsqrtf`, portable `expf_det` in SiLU) cost ~3-5% overhead.
 - **Specific environment.** We targeted one setup: **RTX 3090 (SM86) + CUDA 12.8**. Different GPUs or CUDA versions may produce different reference outputs — the JIT compiler generates different machine code per architecture. Extending to other GPUs means re-verifying (and possibly re-tuning) the CPU shadow.
-- **One quant format.** Verified for Q4_K_M (the most common GGUF quantization). Other formats need additional work.
+- **Two quant formats.** Verified for Q4_K_M and IQ4_XS. Other formats (Q5_K, Q8_0, IQ4_NL) have deterministic dot products written but need end-to-end testing.
 
 ## What had to be fixed
 
@@ -104,10 +118,10 @@ See [docs/investigation.md](docs/investigation.md) for the full technical story,
 
 ## Current scope
 
-- Built on top of the [llama.cpp deterministic branch](https://github.com/ggml-org/llama.cpp/tree/deterministic) (commit `d092e268`)
-- Verified for **Q4_K_M** quantization on **RTX 3090 / CUDA 12.8**
-- Tested with qwen2.5-3b — small enough to run on any machine
-- IQ4_XS, MoE models, and other GPU architectures need additional work
+- Built on top of the [llama.cpp deterministic branch](https://github.com/ggml-org/llama.cpp/tree/deterministic) (commit `7c203670`)
+- Verified for **Q4_K_M** and **IQ4_XS** quantization on **RTX 3090 / CUDA 12.8**
+- Standard transformer (Llama-3.2-3B, Qwen2.5-3B) and **hybrid Mamba** (Qwen3.5-4B) architectures
+- Tested with models small enough to run on any machine
 
 ## License
 

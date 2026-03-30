@@ -1,83 +1,241 @@
-From 4f19b36c532f680b86058c3a638ecbc7c011d556 Mon Sep 17 00:00:00 2001
+From 16e0ecd1a5649959f5c6a68bb9188d63a4766865 Mon Sep 17 00:00:00 2001
 From: Andrew Miller <soc1024@illinois.edu>
-Date: Sun, 29 Mar 2026 12:57:37 -0400
-Subject: [PATCH 1/6] CPU-GPU bitwise parity: 100% tensor match for Q4_K_M
- models
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
+Date: Mon, 30 Mar 2026 12:36:44 -0400
+Subject: [PATCH] CPU-GPU bitwise parity: standard transformers + Qwen3.5
+ hybrid Mamba
 
-18 phases of fixes achieving bitwise-identical output between
-CUDA GPU (3090/SM86) and x86 CPU for deterministic inference.
+Full bitwise tensor match between GPU (RTX 3090/CUDA 12.8) and CPU
+(x86-64 with FMA) for IQ4_XS and Q4_K_M quantization formats across
+both standard transformer and hybrid Mamba/linear-attention architectures.
 
-Verified: 2462/2462 tensors match, all tokens identical at temp 0.7,
-any prompt length, through full autoregressive decode.
+Verified models:
+- Llama-3.2-3B-Instruct-IQ4_XS: 18375/18375 tensors (standard transformer)
+- Qwen3.5-4B-IQ4_XS (unsloth): 15246/15246 tensors (hybrid Mamba)
+- Qwen3.5-4B-IQ4_XS (heretic): 15246/15246 tensors (hybrid Mamba)
+- qwen2.5-3b Q4_K_M: full match (dense + MoE)
 
-Key fixes:
-- Portable math: expf_det, sincosf_det, powf_int_det, silu_det
-  (CUDA device transcendentals differ from glibc by ±1 ULP)
-- RMSNorm: double-buffered butterfly matching GPU warp shuffle,
-  __frsqrt_rn replacing approximate rsqrtf, double-precision CPU rsqrt
-- Q4_K/Q6_K matmul: explicit FMA matching NVCC auto-fusion patterns,
-  warp-parallel accumulation with butterfly reduction
-- Flash attention: tile-based softmax with butterfly kqsum,
-  FP32 Q·K dot product, direct VKQ/S division (not 1/S * VKQ)
-- Q8_1 quantization: x86 SIMD bypass to use roundf(x/d) matching GPU
-- Per-column mmvq: forces ncols=1 kernel for batch-size-independent SASS
-- Build: -mfma for hardware FMA parity with NVCC auto-contraction
-
-Root causes found:
-- Every CUDA transcendental (expf, sinf, cosf, powf, rsqrtf) differs
-  from glibc by ±1 ULP — portable implementations needed on both sides
-- x86 arch-specific Q8_1 used reciprocal multiply (127/max * x) while
-  GPU uses direct division (x / (max/127)) — different rounding
-- ptxas JIT generates different SASS per ncols_dst template parameter —
-  must force single-column processing for deterministic builds
-- GPU attention processes K-V in tiles with warp butterfly reduction;
-  CPU must match tile structure, not use sequential online softmax
+Key changes:
+- Portable math: expf_det, sincosf_det, powf_int_det, silu_det, logf_det
+- Deterministic dot products: IQ4_XS, Q5_K, Q8_0, IQ4_NL, F32
+- CPU attention matching GPU fattn-vec warp structure
+- F32 matmul serialization (bypass cuBLAS in deterministic mode)
+- Deterministic solve_tri, sum_rows, L2 norm, SSM conv
+- mrope powf_int_det for hybrid architectures
+- exp/expm1 unary op deterministic guards
+- gated_delta_net.cu portable expf
+- Q8_0 dot product: 4-thread-per-block structure matching GPU mmvq
 
 Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
 ---
- ggml/include/ggml-deterministic.h    | 121 +++++++++++
- ggml/src/ggml-cpu/arch/x86/quants.c  |   7 +
- ggml/src/ggml-cpu/ggml-cpu.c         |  48 +++--
- ggml/src/ggml-cpu/ops.cpp            | 304 +++++++++++++++++++++++++--
- ggml/src/ggml-cpu/quants.c           | 176 ++++++++++++++++
- ggml/src/ggml-cpu/quants.h           |   2 +
- ggml/src/ggml-cpu/vec.cpp            |  11 +
- ggml/src/ggml-cpu/vec.h              |   4 +
- ggml/src/ggml-cuda/CMakeLists.txt    |   6 +-
- ggml/src/ggml-cuda/fattn-vec-f32.cuh |  17 ++
- ggml/src/ggml-cuda/ggml-cuda.cu      |  14 +-
- ggml/src/ggml-cuda/mmvq.cu           |  21 ++
- ggml/src/ggml-cuda/norm.cu           |   4 +
- ggml/src/ggml-cuda/rope.cu           |  15 ++
- ggml/src/ggml-cuda/unary.cu          |   5 +
- ggml/src/ggml-cuda/vecdotq.cuh       |   7 +
- ggml/src/ggml-deterministic.h        | 121 +++++++++++
- ggml/src/ggml-quants.c               |  26 ++-
- src/llama-graph.cpp                  |   2 +-
- tests/test-expf-parity.cu            |  54 +++++
- tests/test-expf-ptx-match.cu         | 125 +++++++++++
- tests/test-portable-expf.cu          | 110 ++++++++++
- tools/CMakeLists.txt                 |   1 +
- tools/det-diag/CMakeLists.txt        |   5 +
- tools/det-diag/det-diag.cpp          | 124 +++++++++++
- 25 files changed, 1277 insertions(+), 53 deletions(-)
+ cpu_tokens.txt                        | 147 +++++++
+ ggml/include/ggml-deterministic.h     | 162 ++++++++
+ ggml/include/ggml.h                   |   2 +
+ ggml/src/CMakeLists.txt               |   4 +
+ ggml/src/ggml-cpu/arch/x86/quants.c   |   7 +
+ ggml/src/ggml-cpu/ggml-cpu.c          |  55 ++-
+ ggml/src/ggml-cpu/ops.cpp             | 507 +++++++++++++++++++-----
+ ggml/src/ggml-cpu/quants.c            | 544 ++++++++++++++++++++++++++
+ ggml/src/ggml-cpu/quants.h            |   7 +
+ ggml/src/ggml-cpu/unary-ops.cpp       |  10 +
+ ggml/src/ggml-cpu/vec.cpp             |  11 +
+ ggml/src/ggml-cpu/vec.h               |   4 +
+ ggml/src/ggml-cuda/CMakeLists.txt     |   7 +-
+ ggml/src/ggml-cuda/fattn-vec.cuh      |  18 +-
+ ggml/src/ggml-cuda/fattn.cu           |   7 +
+ ggml/src/ggml-cuda/gated_delta_net.cu |  13 +-
+ ggml/src/ggml-cuda/ggml-cuda.cu       |  88 ++++-
+ ggml/src/ggml-cuda/mmvq.cu            |  19 +
+ ggml/src/ggml-cuda/norm.cu            |   8 +
+ ggml/src/ggml-cuda/rope.cu            |  37 +-
+ ggml/src/ggml-cuda/softmax.cu         |  13 +
+ ggml/src/ggml-cuda/solve_tri.cu       |  46 +++
+ ggml/src/ggml-cuda/ssm-scan.cu        |  20 +-
+ ggml/src/ggml-cuda/sumrows.cu         |  22 +-
+ ggml/src/ggml-cuda/unary.cu           |  16 +
+ ggml/src/ggml-cuda/unary.cuh          |   5 +
+ ggml/src/ggml-cuda/vecdotq.cuh        |  10 +
+ ggml/src/ggml-deterministic.h         | 162 ++++++++
+ ggml/src/ggml-impl.h                  |   1 +
+ ggml/src/ggml-quants.c                |  27 +-
+ ggml/src/ggml.c                       |  14 +
+ gpu_tokens.txt                        | 158 ++++++++
+ src/llama-context.cpp                 |   7 +-
+ tools/CMakeLists.txt                  |   1 +
+ tools/det-diag/CMakeLists.txt         |   5 +
+ tools/det-diag/Dockerfile             |  21 +
+ tools/det-diag/README.md              |  90 +++++
+ tools/det-diag/det-diag.cpp           | 144 +++++++
+ tools/det-diag/verify.sh              |  71 ++++
+ 39 files changed, 2341 insertions(+), 149 deletions(-)
+ create mode 100644 cpu_tokens.txt
  create mode 100644 ggml/include/ggml-deterministic.h
  create mode 100644 ggml/src/ggml-deterministic.h
- create mode 100644 tests/test-expf-parity.cu
- create mode 100644 tests/test-expf-ptx-match.cu
- create mode 100644 tests/test-portable-expf.cu
+ create mode 100644 gpu_tokens.txt
  create mode 100644 tools/det-diag/CMakeLists.txt
+ create mode 100644 tools/det-diag/Dockerfile
+ create mode 100644 tools/det-diag/README.md
  create mode 100644 tools/det-diag/det-diag.cpp
+ create mode 100755 tools/det-diag/verify.sh
 
+diff --git a/cpu_tokens.txt b/cpu_tokens.txt
+new file mode 100644
+index 00000000..f3e3f795
+--- /dev/null
++++ b/cpu_tokens.txt
+@@ -0,0 +1,147 @@
++build: 123 (7c203670) with GNU 11.4.0 for Linux x86_64
++llama_model_loader: loaded meta data with 35 key-value pairs and 255 tensors from /media/amiller/fractal-nvme2/gguf-models/Llama-3.2-3B-Instruct-IQ4_XS.gguf (version GGUF V3 (latest))
++llama_model_loader: Dumping metadata keys/values. Note: KV overrides do not apply in this output.
++llama_model_loader: - kv   0:                       general.architecture str              = llama
++llama_model_loader: - kv   1:                               general.type str              = model
++llama_model_loader: - kv   2:                               general.name str              = Llama 3.2 3B Instruct
++llama_model_loader: - kv   3:                           general.finetune str              = Instruct
++llama_model_loader: - kv   4:                           general.basename str              = Llama-3.2
++llama_model_loader: - kv   5:                         general.size_label str              = 3B
++llama_model_loader: - kv   6:                            general.license str              = llama3.2
++llama_model_loader: - kv   7:                               general.tags arr[str,6]       = ["facebook", "meta", "pytorch", "llam...
++llama_model_loader: - kv   8:                          general.languages arr[str,8]       = ["en", "de", "fr", "it", "pt", "hi", ...
++llama_model_loader: - kv   9:                          llama.block_count u32              = 28
++llama_model_loader: - kv  10:                       llama.context_length u32              = 131072
++llama_model_loader: - kv  11:                     llama.embedding_length u32              = 3072
++llama_model_loader: - kv  12:                  llama.feed_forward_length u32              = 8192
++llama_model_loader: - kv  13:                 llama.attention.head_count u32              = 24
++llama_model_loader: - kv  14:              llama.attention.head_count_kv u32              = 8
++llama_model_loader: - kv  15:                       llama.rope.freq_base f32              = 500000.000000
++llama_model_loader: - kv  16:     llama.attention.layer_norm_rms_epsilon f32              = 0.000010
++llama_model_loader: - kv  17:                 llama.attention.key_length u32              = 128
++llama_model_loader: - kv  18:               llama.attention.value_length u32              = 128
++llama_model_loader: - kv  19:                          general.file_type u32              = 30
++llama_model_loader: - kv  20:                           llama.vocab_size u32              = 128256
++llama_model_loader: - kv  21:                 llama.rope.dimension_count u32              = 128
++llama_model_loader: - kv  22:                       tokenizer.ggml.model str              = gpt2
++llama_model_loader: - kv  23:                         tokenizer.ggml.pre str              = llama-bpe
++llama_model_loader: - kv  24:                      tokenizer.ggml.tokens arr[str,128256]  = ["!", "\"", "#", "$", "%", "&", "'", ...
++llama_model_loader: - kv  25:                  tokenizer.ggml.token_type arr[i32,128256]  = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, ...
++llama_model_loader: - kv  26:                      tokenizer.ggml.merges arr[str,280147]  = ["Ġ Ġ", "Ġ ĠĠĠ", "ĠĠ ĠĠ", "...
++llama_model_loader: - kv  27:                tokenizer.ggml.bos_token_id u32              = 128000
++llama_model_loader: - kv  28:                tokenizer.ggml.eos_token_id u32              = 128009
++llama_model_loader: - kv  29:                    tokenizer.chat_template str              = {{- bos_token }}\n{%- if custom_tools ...
++llama_model_loader: - kv  30:               general.quantization_version u32              = 2
++llama_model_loader: - kv  31:                      quantize.imatrix.file str              = /models_out/Llama-3.2-3B-Instruct-GGU...
++llama_model_loader: - kv  32:                   quantize.imatrix.dataset str              = /training_dir/calibration_datav3.txt
++llama_model_loader: - kv  33:             quantize.imatrix.entries_count i32              = 196
++llama_model_loader: - kv  34:              quantize.imatrix.chunks_count i32              = 125
++llama_model_loader: - type  f32:   58 tensors
++llama_model_loader: - type q6_K:    1 tensors
++llama_model_loader: - type iq4_xs:  196 tensors
++print_info: file format = GGUF V3 (latest)
++print_info: file type   = IQ4_XS - 4.25 bpw
++print_info: file size   = 1.70 GiB (4.54 BPW) 
++load: 0 unused tokens
++load: printing all EOG tokens:
++load:   - 128001 ('<|end_of_text|>')
++load:   - 128008 ('<|eom_id|>')
++load:   - 128009 ('<|eot_id|>')
++load: special tokens cache size = 256
++load: token to piece cache size = 0.7999 MB
++print_info: arch                  = llama
++print_info: vocab_only            = 0
++print_info: no_alloc              = 0
++print_info: n_ctx_train           = 131072
++print_info: n_embd                = 3072
++print_info: n_embd_inp            = 3072
++print_info: n_layer               = 28
++print_info: n_head                = 24
++print_info: n_head_kv             = 8
++print_info: n_rot                 = 128
++print_info: n_swa                 = 0
++print_info: is_swa_any            = 0
++print_info: n_embd_head_k         = 128
++print_info: n_embd_head_v         = 128
++print_info: n_gqa                 = 3
++print_info: n_embd_k_gqa          = 1024
++print_info: n_embd_v_gqa          = 1024
++print_info: f_norm_eps            = 0.0e+00
++print_info: f_norm_rms_eps        = 1.0e-05
++print_info: f_clamp_kqv           = 0.0e+00
++print_info: f_max_alibi_bias      = 0.0e+00
++print_info: f_logit_scale         = 0.0e+00
++print_info: f_attn_scale          = 0.0e+00
++print_info: n_ff                  = 8192
++print_info: n_expert              = 0
++print_info: n_expert_used         = 0
++print_info: n_expert_groups       = 0
++print_info: n_group_used          = 0
++print_info: causal attn           = 1
++print_info: pooling type          = -1
++print_info: rope type             = 0
++print_info: rope scaling          = linear
++print_info: freq_base_train       = 500000.0
++print_info: freq_scale_train      = 1
++print_info: n_ctx_orig_yarn       = 131072
++print_info: rope_yarn_log_mul     = 0.0000
++print_info: rope_finetuned        = unknown
++print_info: model type            = 3B
++print_info: model params          = 3.21 B
++print_info: general.name          = Llama 3.2 3B Instruct
++print_info: vocab type            = BPE
++print_info: n_vocab               = 128256
++print_info: n_merges              = 280147
++print_info: BOS token             = 128000 '<|begin_of_text|>'
++print_info: EOS token             = 128009 '<|eot_id|>'
++print_info: EOT token             = 128009 '<|eot_id|>'
++print_info: EOM token             = 128008 '<|eom_id|>'
++print_info: LF token              = 198 'Ċ'
++print_info: EOG token             = 128001 '<|end_of_text|>'
++print_info: EOG token             = 128008 '<|eom_id|>'
++print_info: EOG token             = 128009 '<|eot_id|>'
++print_info: max token length      = 256
++load_tensors: loading model tensors, this can take a while... (mmap = true, direct_io = false)
++load_tensors:   CPU_Mapped model buffer size =  1736.90 MiB
++....................................................................................
++llama_context: constructing llama_context
++llama_context: n_seq_max     = 1
++llama_context: n_ctx         = 131072
++llama_context: n_ctx_seq     = 131072
++llama_context: n_batch       = 2048
++llama_context: n_ubatch      = 512
++llama_context: causal_attn   = 1
++llama_context: flash_attn    = auto
++llama_context: kv_unified    = false
++llama_context: freq_base     = 500000.0
++llama_context: freq_scale    = 1
++llama_context:        CPU  output buffer size =     0.49 MiB
++llama_kv_cache:        CPU KV buffer size = 14336.00 MiB
++llama_kv_cache: size = 14336.00 MiB (131072 cells,  28 layers,  1/1 seqs), K (f16): 7168.00 MiB, V (f16): 7168.00 MiB
++sched_reserve: reserving ...
++sched_reserve: Flash Attention was auto, set to enabled
++sched_reserve:        CPU compute buffer size =   414.01 MiB
++sched_reserve: graph nodes  = 875
++sched_reserve: graph splits = 1
++sched_reserve: reserve took 2.46 ms, sched copies = 1
++Token 0: id=627 '.
++'
++Token 1: id=2028 'This'
++Token 2: id=374 ' is'
++Token 3: id=264 ' a'
++Token 4: id=11495 ' famous'
++Token 5: id=97974 ' pang'
++Token 6: id=2453 'ram'
++Token 7: id=11 ','
++Token 8: id=264 ' a'
++Token 9: id=17571 ' phrase'
++Token 10: id=430 ' that'
++Token 11: id=5829 ' uses'
++Token 12: id=682 ' all'
++Token 13: id=279 ' the'
++Token 14: id=12197 ' letters'
++Token 15: id=315 ' of'
++Token 16: id=279 ' the'
++Token 17: id=28890 ' alphabet'
++Token 18: id=520 ' at'
++Token 19: id=3325 ' least'
 diff --git a/ggml/include/ggml-deterministic.h b/ggml/include/ggml-deterministic.h
 new file mode 100644
-index 00000000..ba71eec8
+index 00000000..6587afbe
 --- /dev/null
 +++ b/ggml/include/ggml-deterministic.h
-@@ -0,0 +1,121 @@
+@@ -0,0 +1,162 @@
 +// Portable math functions for GPU-CPU deterministic parity.
 +// These use only FMA + basic IEEE ops, producing bitwise-identical
 +// results on both CUDA and x86 when compiled with FMA support.
@@ -191,6 +349,47 @@ index 00000000..ba71eec8
 +    *cp = c;
 +}
 +
++// Portable logf using Cody-Waite style reduction.
++// Uses the identity: log(x) = log(2) * (e + log2(m)) where x = m * 2^e, 1 <= m < 2
++// Then log2(m) ≈ polynomial on [1,2)
++static inline
++#ifdef __CUDA_ARCH__
++__device__
++#endif
++float logf_det(float x) {
++    // Decompose x = m * 2^e via bit manipulation
++    union { float f; uint32_t u; } conv;
++    conv.f = x;
++    int e = (int)((conv.u >> 23) & 0xFF) - 127;
++    conv.u = (conv.u & 0x007FFFFF) | 0x3F800000; // m in [1, 2)
++    float m = conv.f;
++
++    // Reduce to f = (m-1)/(m+1), then log(m) = 2*f*(1 + f²/3 + f⁴/5 + ...)
++    float f = (m - 1.0f) / (m + 1.0f);
++    float f2 = f * f;
++
++    // Minimax polynomial: log(m) ≈ 2*f * (1 + c1*f² + c2*f⁴ + c3*f⁶)
++    float p = DET_FMA(0.2424046874f, f2, 0.4005714059f);
++    p = DET_FMA(p, f2, 0.6666666269f);
++    p = DET_FMA(p, f2, 2.0f);
++    float log_m = f * p;
++
++    // log(x) = e * ln(2) + log(m)
++    const float ln2 = 0.6931471805599453f;
++    return DET_FMA((float)e, ln2, log_m);
++}
++
++// Portable softplus: log(1 + exp(x))
++static inline
++#ifdef __CUDA_ARCH__
++__device__
++#endif
++float softplus_det(float x) {
++    if (x > 20.0f) return x;
++    float ex = expf_det(x);
++    return logf_det(1.0f + ex);
++}
++
 +// Portable SiLU using expf_det
 +static inline
 +#ifdef __CUDA_ARCH__
@@ -199,8 +398,36 @@ index 00000000..ba71eec8
 +float silu_det(float x) {
 +    return x / (1.0f + expf_det(-x));
 +}
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index 669f66b6..9a07a617 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -798,6 +798,8 @@ extern "C" {
+     GGML_API bool    ggml_get_no_alloc(struct ggml_context * ctx);
+     GGML_API void    ggml_set_no_alloc(struct ggml_context * ctx, bool no_alloc);
+ 
++    GGML_API bool    ggml_is_deterministic(void);
++
+     GGML_API void *  ggml_get_mem_buffer     (const struct ggml_context * ctx);
+     GGML_API size_t  ggml_get_mem_size       (const struct ggml_context * ctx);
+     GGML_API size_t  ggml_get_max_tensor_size(const struct ggml_context * ctx);
+diff --git a/ggml/src/CMakeLists.txt b/ggml/src/CMakeLists.txt
+index 78853304..bb4a25c6 100644
+--- a/ggml/src/CMakeLists.txt
++++ b/ggml/src/CMakeLists.txt
+@@ -221,6 +221,10 @@ if (GGML_SCHED_NO_REALLOC)
+     target_compile_definitions(ggml-base PUBLIC GGML_SCHED_NO_REALLOC)
+ endif()
+ 
++if (GGML_DETERMINISTIC)
++    target_compile_definitions(ggml-base PUBLIC GGML_DETERMINISTIC)
++endif()
++
+ add_library(ggml
+             ggml-backend-dl.cpp
+             ggml-backend-reg.cpp)
 diff --git a/ggml/src/ggml-cpu/arch/x86/quants.c b/ggml/src/ggml-cpu/arch/x86/quants.c
-index cb49320a..247eecf3 100644
+index 74d699f6..48f52b9a 100644
 --- a/ggml/src/ggml-cpu/arch/x86/quants.c
 +++ b/ggml/src/ggml-cpu/arch/x86/quants.c
 @@ -386,6 +386,13 @@ void quantize_row_q8_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, i
@@ -218,17 +445,19 @@ index cb49320a..247eecf3 100644
      const int nb = k / QK8_1;
  
 diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
-index c1312908..6f03dd82 100644
+index df17cc55..4bf0f57c 100644
 --- a/ggml/src/ggml-cpu/ggml-cpu.c
 +++ b/ggml/src/ggml-cpu/ggml-cpu.c
-@@ -382,6 +382,24 @@ const struct ggml_type_traits_cpu * ggml_get_type_traits_cpu(enum ggml_type type
+@@ -399,6 +399,31 @@ const struct ggml_type_traits_cpu * ggml_get_type_traits_cpu(enum ggml_type type
      return &type_traits_cpu[type];
  }
  
 +// Deterministic overrides: use Q8_1 quantization for K-quant types to match GPU's mmvq path
 +static inline enum ggml_type det_vec_dot_type(enum ggml_type src0_type) {
 +    enum ggml_type vdt = type_traits_cpu[src0_type].vec_dot_type;
-+    if (ggml_is_deterministic() && (src0_type == GGML_TYPE_Q4_K || src0_type == GGML_TYPE_Q6_K)) {
++    if (ggml_is_deterministic() && (src0_type == GGML_TYPE_Q4_K || src0_type == GGML_TYPE_Q5_K ||
++                                    src0_type == GGML_TYPE_Q6_K || src0_type == GGML_TYPE_Q8_0 ||
++                                    src0_type == GGML_TYPE_IQ4_XS || src0_type == GGML_TYPE_IQ4_NL)) {
 +        vdt = GGML_TYPE_Q8_1;
 +    }
 +    return vdt;
@@ -237,8 +466,13 @@ index c1312908..6f03dd82 100644
 +static inline ggml_vec_dot_t det_vec_dot(enum ggml_type src0_type) {
 +    ggml_vec_dot_t vd = type_traits_cpu[src0_type].vec_dot;
 +    if (ggml_is_deterministic()) {
-+        if (src0_type == GGML_TYPE_Q4_K) vd = ggml_vec_dot_q4_K_q8_1_det;
-+        if (src0_type == GGML_TYPE_Q6_K) vd = ggml_vec_dot_q6_K_q8_1_det;
++        if (src0_type == GGML_TYPE_Q4_K)   vd = ggml_vec_dot_q4_K_q8_1_det;
++        if (src0_type == GGML_TYPE_Q5_K)   vd = ggml_vec_dot_q5_K_q8_1_det;
++        if (src0_type == GGML_TYPE_Q6_K)   vd = ggml_vec_dot_q6_K_q8_1_det;
++        if (src0_type == GGML_TYPE_Q8_0)   vd = ggml_vec_dot_q8_0_q8_1_det;
++        if (src0_type == GGML_TYPE_IQ4_XS) vd = ggml_vec_dot_iq4_xs_q8_1_det;
++        if (src0_type == GGML_TYPE_IQ4_NL) vd = ggml_vec_dot_iq4_nl_q8_1_det;
++        if (src0_type == GGML_TYPE_F32)    vd = ggml_vec_dot_f32_det;
 +    }
 +    return vd;
 +}
@@ -246,7 +480,7 @@ index c1312908..6f03dd82 100644
  //
  // Threading defs
  //
-@@ -1129,15 +1147,13 @@ static void ggml_compute_forward_mul_mat_one_chunk(
+@@ -1159,15 +1184,13 @@ static void ggml_compute_forward_mul_mat_one_chunk(
  
      const bool src1_cont = ggml_is_contiguous(src1);
  
@@ -264,7 +498,7 @@ index c1312908..6f03dd82 100644
      // threads with no work simply yield (not sure if it helps)
      if (ir0_start >= ir0_end || ir1_start >= ir1_end) {
          return;
-@@ -1214,7 +1230,7 @@ void ggml_compute_forward_mul_mat(
+@@ -1244,7 +1267,7 @@ void ggml_compute_forward_mul_mat(
      const int ith = params->ith;
      const int nth = params->nth;
  
@@ -273,7 +507,7 @@ index c1312908..6f03dd82 100644
      ggml_from_float_t        const from_float           = type_traits_cpu[vec_dot_type].from_float;
      int64_t                  const vec_dot_num_rows     = type_traits_cpu[src0->type].nrows;
  
-@@ -1236,15 +1252,19 @@ void ggml_compute_forward_mul_mat(
+@@ -1266,15 +1289,19 @@ void ggml_compute_forward_mul_mat(
      // nb01 >= nb00 - src0 is not transposed
      //   compute by src0 rows
  
@@ -296,7 +530,7 @@ index c1312908..6f03dd82 100644
          for (int64_t i13 = 0; i13 < ne13; i13++)
              for (int64_t i12 = 0; i12 < ne12; i12++)
                  if (!llamafile_sgemm(params,
-@@ -1309,7 +1329,7 @@ UseGgmlGemm1:;
+@@ -1339,7 +1366,7 @@ UseGgmlGemm1:;
      ggml_barrier(params->threadpool);
  
  #if GGML_USE_LLAMAFILE
@@ -305,7 +539,7 @@ index c1312908..6f03dd82 100644
          const void* wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
          const size_t row_size = ggml_row_size(vec_dot_type, ne10);
  
-@@ -1425,8 +1445,8 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
+@@ -1455,8 +1482,8 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
  
      const enum ggml_type type = src0->type;
  
@@ -316,7 +550,7 @@ index c1312908..6f03dd82 100644
  
      const int64_t blck_0 = 16;
      const int64_t blck_1 = 16;
-@@ -1493,7 +1513,7 @@ static void ggml_compute_forward_mul_mat_id(
+@@ -1523,7 +1550,7 @@ static void ggml_compute_forward_mul_mat_id(
  
      const bool src1_cont = ggml_is_contiguous(src1);
  
@@ -325,7 +559,7 @@ index c1312908..6f03dd82 100644
      ggml_from_float_t const from_float      = type_traits_cpu[vec_dot_type].from_float;
  
      // we don't support permuted src0 or src1
-@@ -2726,7 +2746,7 @@ struct ggml_cplan ggml_graph_plan(
+@@ -2793,7 +2820,7 @@ struct ggml_cplan ggml_graph_plan(
                      } break;
                  case GGML_OP_MUL_MAT:
                      {
@@ -334,7 +568,7 @@ index c1312908..6f03dd82 100644
  
                          if (node->src[1]->type != vec_dot_type) {
                              cur = ggml_row_size(vec_dot_type, ggml_nelements(node->src[1]));
-@@ -2738,7 +2758,7 @@ struct ggml_cplan ggml_graph_plan(
+@@ -2805,7 +2832,7 @@ struct ggml_cplan ggml_graph_plan(
                          const struct ggml_tensor * src0 = node->src[0];
                          const struct ggml_tensor * src1 = node->src[1];
                          const struct ggml_tensor * ids = node->src[2];
@@ -344,33 +578,47 @@ index c1312908..6f03dd82 100644
                          // src1
                          if (src1->type != vec_dot_type) {
 diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
-index 212e52ef..4c640e76 100644
+index d950972c..a7e238c1 100644
 --- a/ggml/src/ggml-cpu/ops.cpp
 +++ b/ggml/src/ggml-cpu/ops.cpp
-@@ -6,6 +6,7 @@
+@@ -7,6 +7,7 @@
  #include "ggml.h"
  #include "unary-ops.h"
  #include "vec.h"
 +#include "ggml-deterministic.h"
  
- #include <float.h>
  #include <algorithm>
-@@ -4315,6 +4316,78 @@ static void ggml_compute_forward_rms_norm_f32(
+ #include <cfloat>
+@@ -1477,7 +1478,16 @@ static void ggml_compute_forward_sum_rows_f32(
+                 float * src_row = (float *) ((char *) src0->data + i1*nb01 + i2*nb02 + i3*nb03);
+                 float * dst_row = (float *) ((char *) dst->data  + i1*nb1  + i2*nb2  + i3*nb3);
+                 float row_sum = 0;
+-                ggml_vec_sum_f32(ne00, &row_sum, src_row);
++                if (ggml_is_deterministic()) {
++                    // Simple sequential float sum matching GPU det kernel
++                    float sum = 0.0f;
++                    for (int64_t i = 0; i < ne00; i++) {
++                        sum += src_row[i];
++                    }
++                    row_sum = sum;
++                } else {
++                    ggml_vec_sum_f32(ne00, &row_sum, src_row);
++                }
+                 dst_row[0] = row_sum;
+             }
+         }
+@@ -3730,6 +3740,60 @@ static void ggml_compute_forward_rms_norm_f32(
  
      GGML_ASSERT(eps >= 0.0f);
  
 +    if (ggml_is_deterministic()) {
-+        // GPU-matching RMSNorm: replicate norm.cu's thread stride + warp butterfly
 +        const int block_size = (ne00 < 1024) ? 256 : 1024;
 +        const int WARP_SIZE = 32;
-+
 +        for (int64_t i03 = 0; i03 < ne03; i03++) {
 +            for (int64_t i02 = 0; i02 < ne02; i02++) {
 +                for (int64_t i01 = ith; i01 < ne01; i01 += nth) {
 +                    const float * x = (float *) ((char *) src0->data + i01*nb01 + i02*nb02 + i03*nb03);
 +                    float * y = (float *) ((char *) dst->data + i01*nb1 + i02*nb2 + i03*nb3);
-+
-+                    // Phase 1: each "thread" accumulates its strided elements
 +                    float partials[1024];
 +                    for (int tid = 0; tid < block_size; tid++) {
 +                        float tmp = 0.0f;
@@ -378,12 +626,8 @@ index 212e52ef..4c640e76 100644
 +                            tmp += x[col] * x[col];
 +                        partials[tid] = tmp;
 +                    }
-+
-+                    // Phase 2+3: warp butterfly + inter-warp butterfly
-+                    // Use double-buffered butterfly for correctness (simultaneous shfl_xor)
-+                    // Warp-level: reduce each group of 32 to lane 0
 +                    for (int w = 0; w < block_size; w += WARP_SIZE) {
-+                        float buf[2][WARP_SIZE];
++                        float buf[2][32];
 +                        memcpy(buf[0], &partials[w], WARP_SIZE * sizeof(float));
 +                        int cur = 0;
 +                        for (int offset = WARP_SIZE/2; offset > 0; offset >>= 1) {
@@ -392,20 +636,17 @@ index 212e52ef..4c640e76 100644
 +                                buf[nxt][lane] = buf[cur][lane] + buf[cur][lane ^ offset];
 +                            cur = nxt;
 +                        }
-+                        partials[w] = buf[cur][0]; // lane 0 result
++                        partials[w] = buf[cur][0];
 +                    }
-+
 +                    float tmp;
 +                    if (block_size <= WARP_SIZE) {
 +                        tmp = partials[0];
 +                    } else {
-+                        // Inter-warp: collect lane 0 from each warp, butterfly again
-+                        float s_sum[WARP_SIZE];
++                        float s_sum[32];
 +                        int n_warps = block_size / WARP_SIZE;
 +                        for (int i = 0; i < n_warps; i++) s_sum[i] = partials[i * WARP_SIZE];
 +                        for (int i = n_warps; i < WARP_SIZE; i++) s_sum[i] = 0.0f;
-+
-+                        float buf2[2][WARP_SIZE];
++                        float buf2[2][32];
 +                        memcpy(buf2[0], s_sum, WARP_SIZE * sizeof(float));
 +                        int cur = 0;
 +                        for (int offset = WARP_SIZE/2; offset > 0; offset >>= 1) {
@@ -416,15 +657,8 @@ index 212e52ef..4c640e76 100644
 +                        }
 +                        tmp = buf2[cur][0];
 +                    }
-+
 +                    const float mean = tmp / (float)ne00;
-+                    // GPU uses rsqrtf(mean+eps) — single rounding
-+                    // CPU's 1/sqrtf(x) has double rounding → differs by 1 ULP
-+                    // Match by computing in double to get correctly-rounded rsqrt
-+                    const float scale = ggml_is_deterministic() ?
-+                        (float)(1.0 / sqrt((double)(mean + eps))) :
-+                        (1.0f / sqrtf(mean + eps));
-+
++                    const float scale = (float)(1.0 / sqrt((double)(mean + eps)));
 +                    memcpy(y, x, ne00 * sizeof(float));
 +                    ggml_vec_scale_f32(ne00, y, scale);
 +                }
@@ -434,7 +668,7 @@ index 212e52ef..4c640e76 100644
      // TODO: optimize
      for (int64_t i03 = 0; i03 < ne03; i03++) {
          for (int64_t i02 = 0; i02 < ne02; i02++) {
-@@ -4331,9 +4404,6 @@ static void ggml_compute_forward_rms_norm_f32(
+@@ -3746,19 +3810,16 @@ static void ggml_compute_forward_rms_norm_f32(
                  float * y = (float *) ((char *) dst->data + i01*nb1 + i02*nb2 + i03*nb3);
  
                  memcpy(y, x, ne00 * sizeof(float));
@@ -444,15 +678,102 @@ index 212e52ef..4c640e76 100644
  
                  const float scale = 1.0f/sqrtf(mean + eps);
  
-@@ -4344,6 +4414,7 @@ static void ggml_compute_forward_rms_norm_f32(
+-                // if you hit this, likely you got an inf somewhere earlier
+                 assert(scale > 0.0f);
+ 
+                 ggml_vec_scale_f32(ne00, y, scale);
              }
          }
      }
-+    } // !deterministic
++    }
  }
  
  void ggml_compute_forward_rms_norm(
-@@ -5933,15 +6004,24 @@ static void ggml_compute_forward_soft_max_f32(
+@@ -4071,24 +4132,66 @@ static void ggml_compute_forward_l2_norm_f32(
+ 
+     GGML_ASSERT(eps >= 0.0f);
+ 
+-    // TODO: optimize
+-    for (int64_t i03 = 0; i03 < ne03; i03++) {
+-        for (int64_t i02 = 0; i02 < ne02; i02++) {
+-            for (int64_t i01 = ith; i01 < ne01; i01 += nth) {
+-                const float * x = (float *) ((char *) src0->data + i01*nb01 + i02*nb02 + i03*nb03);
++    if (ggml_is_deterministic()) {
++        // Match GPU l2_norm_f32: block_size=32, float accumulation,
++        // warp_reduce_sum butterfly, rsqrtf(fmaxf(tmp, eps*eps))
++        const int block_size = 32;
++        for (int64_t i03 = 0; i03 < ne03; i03++) {
++            for (int64_t i02 = 0; i02 < ne02; i02++) {
++                for (int64_t i01 = ith; i01 < ne01; i01 += nth) {
++                    const float * x = (float *) ((char *) src0->data + i01*nb01 + i02*nb02 + i03*nb03);
++                    float * y = (float *) ((char *) dst->data + i01*nb1 + i02*nb2 + i03*nb3);
++
++                    // Per-thread partial sums matching GPU strided access
++                    float partials[32];
++                    for (int tid = 0; tid < block_size; tid++) {
++                        float tmp = 0.0f;
++                        for (int64_t col = tid; col < ne00; col += block_size) {
++                            tmp = fmaf(x[col], x[col], tmp);
++                        }
++                        partials[tid] = tmp;
++                    }
+ 
+-                ggml_float sum = 0.0;
+-                for (int64_t i00 = 0; i00 < ne00; i00++) {
+-                    sum += (ggml_float)(x[i00] * x[i00]);
++                    // Butterfly reduction matching warp_reduce_sum
++                    float rb[2][32];
++                    memcpy(rb[0], partials, 32 * sizeof(float));
++                    int c = 0;
++                    for (int off = 16; off > 0; off >>= 1) {
++                        int n = 1 - c;
++                        for (int lane = 0; lane < 32; lane++)
++                            rb[n][lane] = rb[c][lane] + rb[c][lane ^ off];
++                        c = n;
++                    }
++                    float sum_sq = rb[c][0];
++
++                    const float sum_clamped = fmaxf(sum_sq, eps * eps);
++                    const float scale = (float)(1.0 / sqrt((double)sum_clamped));
++
++                    memcpy(y, x, ne00 * sizeof(float));
++                    ggml_vec_scale_f32(ne00, y, scale);
+                 }
++            }
++        }
++    } else {
++        // TODO: optimize
++        for (int64_t i03 = 0; i03 < ne03; i03++) {
++            for (int64_t i02 = 0; i02 < ne02; i02++) {
++                for (int64_t i01 = ith; i01 < ne01; i01 += nth) {
++                    const float * x = (float *) ((char *) src0->data + i01*nb01 + i02*nb02 + i03*nb03);
+ 
+-                float * y = (float *) ((char *) dst->data + i01*nb1 + i02*nb2 + i03*nb3);
++                    ggml_float sum = 0.0;
++                    for (int64_t i00 = 0; i00 < ne00; i00++) {
++                        sum += (ggml_float)(x[i00] * x[i00]);
++                    }
+ 
+-                memcpy(y, x, ne00 * sizeof(float));
++                    float * y = (float *) ((char *) dst->data + i01*nb1 + i02*nb2 + i03*nb3);
+ 
+-                const float scale = 1.0f/fmaxf(sqrtf(sum), eps);
++                    memcpy(y, x, ne00 * sizeof(float));
+ 
+-                ggml_vec_scale_f32(ne00, y, scale);
++                    const float scale = 1.0f/fmaxf(sqrtf(sum), eps);
++
++                    ggml_vec_scale_f32(ne00, y, scale);
++                }
+             }
+         }
+     }
+@@ -5314,20 +5417,63 @@ static void ggml_compute_forward_soft_max_f32(
+                 float max = -INFINITY;
+                 ggml_vec_max_f32(ne00, &max, wp);
+ 
+-                // if we have sinks, make a correction as if they were included in the softmax
+                 if (sk) {
                      max = MAX(max, sk[i02]);
                  }
  
@@ -463,14 +784,49 @@ index 212e52ef..4c640e76 100644
 -                    sum += (ggml_float) expf(sk[i02] - max);
 +                float sumf;
 +                if (ggml_is_deterministic()) {
-+                    // GPU softmax accumulates in float, not double — match it
-+                    sumf = 0.0f;
-+                    for (int i = 0; i < ne00; ++i) {
-+                        float val = expf(wp[i] - max);
-+                        dp[i] = val;
-+                        sumf += val;
++                    for (int i = 0; i < ne00; ++i)
++                        dp[i] = expf_det(wp[i] - max);
++                    int block_size = 32;
++                    for (int bs = 64; bs <= 256 && bs <= ne00; bs += 32)
++                        if ((ne00 + bs - 1) / bs < (ne00 + block_size - 1) / block_size)
++                            block_size = bs;
++                    const int WARP_SIZE = 32, nwarps = block_size / WARP_SIZE;
++                    float thread_sums[256];
++                    for (int tid = 0; tid < block_size; tid++) {
++                        float s = 0.0f;
++                        for (int col = tid; col < ne00; col += block_size)
++                            s += dp[col];
++                        thread_sums[tid] = s;
 +                    }
-+                    if (sk) sumf += expf(sk[i02] - max);
++                    float warp_results[8];
++                    for (int w = 0; w < nwarps; w++) {
++                        float buf[2][32];
++                        memcpy(buf[0], &thread_sums[w*WARP_SIZE], WARP_SIZE*sizeof(float));
++                        int cur = 0;
++                        for (int off = WARP_SIZE/2; off > 0; off >>= 1) {
++                            int nxt = 1 - cur;
++                            for (int lane = 0; lane < WARP_SIZE; lane++)
++                                buf[nxt][lane] = buf[cur][lane] + buf[cur][lane ^ off];
++                            cur = nxt;
++                        }
++                        warp_results[w] = buf[cur][0];
++                    }
++                    if (nwarps > 1) {
++                        float ibuf[2][32];
++                        for (int i = 0; i < 32; i++)
++                            ibuf[0][i] = (i < nwarps) ? warp_results[i] : 0.0f;
++                        int cur = 0;
++                        for (int off = WARP_SIZE/2; off > 0; off >>= 1) {
++                            int nxt = 1 - cur;
++                            for (int lane = 0; lane < WARP_SIZE; lane++)
++                                ibuf[nxt][lane] = ibuf[cur][lane] + ibuf[cur][lane ^ off];
++                            cur = nxt;
++                        }
++                        sumf = ibuf[cur][0];
++                    } else {
++                        sumf = warp_results[0];
++                    }
++                    if (sk) sumf += expf_det(sk[i02] - max);
 +                    sumf = 1.0f / sumf;
 +                } else {
 +                    ggml_float sum = ggml_vec_soft_max_f32(ne00, dp, wp, max);
@@ -485,7 +841,7 @@ index 212e52ef..4c640e76 100644
  
  #ifndef NDEBUG
                  for (int i = 0; i < ne00; ++i) {
-@@ -6226,8 +6306,14 @@ static void rope_yarn(
+@@ -5613,8 +5759,14 @@ static void rope_yarn(
          // Get n-d magnitude scaling corrected for interpolation
          mscale *= 1.0f + 0.1f * logf(1.0f / freq_scale);
      }
@@ -502,12 +858,10 @@ index 212e52ef..4c640e76 100644
  }
  
  static void ggml_rope_cache_init(
-@@ -6236,13 +6322,20 @@ static void ggml_rope_cache_init(
+@@ -5623,13 +5775,18 @@ static void ggml_rope_cache_init(
      // ref: https://github.com/jquesnelle/yarn/blob/master/scaled_rope/LlamaYaRNScaledRotaryEmbedding.py
      float theta = theta_base;
      for (int64_t i0 = 0; i0 < ne0; i0 += 2) {
-+        // GPU computes theta = pos * powf(theta_scale, i0/2) per dimension.
-+        // Iterative theta *= theta_scale accumulates FP32 rounding. Match GPU with powf.
 +        if (ggml_is_deterministic()) {
 +            theta = theta_base * powf_int_det(theta_scale, (int)(i0/2));
 +        }
@@ -524,234 +878,313 @@ index 212e52ef..4c640e76 100644
      }
  }
  
-@@ -6454,7 +6547,12 @@ static void ggml_compute_forward_rope_f32(
-                         const float x1 = src[1];
+@@ -5651,21 +5808,20 @@ static void ggml_mrope_cache_init(
+         const float ff = freq_factors ? freq_factors[i0/2] : 1.0f;
  
-                         dst_data[0] = x0*cos_theta - x1*sin_theta;
--                        dst_data[1] = x0*sin_theta + x1*cos_theta;
-+                        // GPU PTX: fma(sin_theta, x0, cos_theta*x1) — fuses the add
-+                        if (ggml_is_deterministic()) {
-+                            dst_data[1] = fmaf(sin_theta, x0, cos_theta * x1);
-+                        } else {
-+                            dst_data[1] = x0*sin_theta + x1*cos_theta;
-+                        }
-                     }
-                 }
- 
-@@ -8785,14 +8883,18 @@ static void ggml_compute_forward_flash_attn_ext_f16(
-         const float slope = (max_bias > 0.0f) ? h < n_head_log2 ? powf(m0, h + 1) : powf(m1, 2*(h - n_head_log2) + 1) : 1.0f;
- 
-         float S = 0.0f;      // sum
--        float M = -INFINITY; // maximum KQ value
-+        float M = ggml_is_deterministic() ? -FLT_MAX/2.0f : -INFINITY; // maximum KQ value
-+        // In deterministic mode, match GPU's -FLT_MAX/2 initialization
- 
-         float       * VKQ32 = (float       *) params->wdata + ith*(1*DK + 2*DV + CACHE_LINE_SIZE_F32); // FP32 VKQ accumulator
-         float       * V32   =                 (VKQ32 + 1*DV); // (temporary) FP32 V buffer
-         ggml_fp16_t * VKQ16 = (ggml_fp16_t *) (VKQ32 + 1*DV); // (temporary) FP16 VKQ accumulator
-         ggml_fp16_t * Q_q   = (ggml_fp16_t *) (VKQ32 + 2*DV); // (temporary) buffer for Q converted to quantized/FP16
- 
--        if (v->type == GGML_TYPE_F16) {
-+        // In deterministic mode, always use FP32 accumulation to match GPU
-+        const bool det_f32_accum = ggml_is_deterministic() && v->type == GGML_TYPE_F16;
+         int sector = (i0 / 2) % sect_dims;
+-        if (indep_sects) {
+-            // compute theta independently for each dim sections
+-            // (i.e. reset corresponding theta when `i0` go from one section to another)
+-            if (sector == 0) {
+-                theta_t = theta_base_t;
+-            }
+-            else if (sector == sections[0]) {
+-                theta_h = theta_base_h;;
+-            }
+-            else if (sector == sec_w) {
+-                theta_w = theta_base_w;
+-            }
+-            else if (sector == sec_e) {
+-                theta_e = theta_base_e;
+-            }
 +
-+        if (v->type == GGML_TYPE_F16 && !det_f32_accum) {
-             memset(VKQ16, 0, DV*sizeof(ggml_fp16_t));
-         } else {
-             memset(VKQ32, 0, DV*sizeof(float));
-@@ -8811,6 +8913,141 @@ static void ggml_compute_forward_flash_attn_ext_f16(
++        if (ggml_is_deterministic()) {
++            // Match GPU rope_multi: pos[i2] * ROPE_POWF(theta_scale, i0/2.0f)
++            // GPU computes theta = pos * powf_int_det(theta_scale, i0/2) per dimension
++            float scale = powf_int_det(theta_scale, (int)(i0 / 2));
++            theta_t = theta_base_t * scale;
++            theta_h = theta_base_h * scale;
++            theta_w = theta_base_w * scale;
++            theta_e = theta_base_e * scale;
++        } else if (indep_sects) {
++            if (sector == 0) theta_t = theta_base_t;
++            else if (sector == sections[0]) theta_h = theta_base_h;
++            else if (sector == sec_w) theta_w = theta_base_w;
++            else if (sector == sec_e) theta_e = theta_base_e;
+         }
+ 
+         float theta = theta_t;
+@@ -5696,10 +5852,12 @@ static void ggml_mrope_cache_init(
+         );
+         cache[i0 + 1] *= sin_sign;
+ 
+-        theta_t *= theta_scale;
+-        theta_w *= theta_scale;
+-        theta_h *= theta_scale;
+-        theta_e *= theta_scale;
++        if (!ggml_is_deterministic()) {
++            theta_t *= theta_scale;
++            theta_w *= theta_scale;
++            theta_h *= theta_scale;
++            theta_e *= theta_scale;
++        }
+     }
+ }
+ 
+@@ -5719,7 +5877,11 @@ static void rotate_pairs(const int64_t n, const int64_t n_offset, const float *
+     const float x1 = type_conversion_table<T>::to_f32(src[n_offset]);
+ 
+     dst[0]        = type_conversion_table<T>::from_f32(x0*cos_theta - x1*sin_theta);
+-    dst[n_offset] = type_conversion_table<T>::from_f32(x0*sin_theta + x1*cos_theta);
++    if (ggml_is_deterministic()) {
++        dst[n_offset] = type_conversion_table<T>::from_f32(fmaf(sin_theta, x0, cos_theta * x1));
++    } else {
++        dst[n_offset] = type_conversion_table<T>::from_f32(x0*sin_theta + x1*cos_theta);
++    }
+   }
+ }
+ 
+@@ -8278,6 +8440,184 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
          const float * pq = (const float *) ((char *) q->data + (iq1*nbq1 + iq2*nbq2 + iq3*nbq3));
          q_to_vec_dot(pq, Q_q, DK);
  
-+        // GPU-matching deterministic attention: compute all KQ first, then softmax, then V
++        // GPU-matching deterministic attention using online softmax
++        // Matches fattn-vec.cuh exactly: 4 warps × 32 threads, nthreads_KQ=8,
++        // nthreads_V=8, V_cols_per_iter=4, batch-32 max, stride-4 V accumulation
 +        if (ggml_is_deterministic()) {
-+            // GPU-matching deterministic attention
-+            // GPU pre-scales Q, does FP32 dot product, tile-based softmax
-+            const int WARP_SIZE = 32;
++            const int nwarps = 4, warp_sz = 32, nthreads_tot = 128;
++            const int nthreads_KQ = 8, cpy_ne = 4, V_cols_per_iter = 4;
++            const float FATTN_KQ_MAX_OFFSET = 3.0f * 0.6931f;
 +
-+            // Pre-scale Q in FP32 (matching GPU's Q conversion)
-+            float Q_scaled[256]; // DK <= 256
-+            for (int64_t d = 0; d < DK; ++d) {
-+                Q_scaled[d] = pq[d] * scale;
-+            }
++            float Q_scaled[256];
++            for (int64_t d = 0; d < DK; ++d) Q_scaled[d] = pq[d] * scale;
 +
-+            // Phase 1: Compute all Q·K values matching GPU dot product
-+            float KQ_stack[4096];
-+            float * KQ_vals = KQ_stack;
++            // Per-warp, per-K_offset V accumulators + per-thread KQ_sum
++            float VKQ_pw[4][4][256];
++            float KQ_max_pw[4];
++            float KQ_sum_pt[4][32];
++            memset(VKQ_pw, 0, sizeof(VKQ_pw));
++            memset(KQ_sum_pt, 0, sizeof(KQ_sum_pt));
++            for (int w = 0; w < nwarps; w++) KQ_max_pw[w] = -FLT_MAX / 2.0f;
 +
-+            for (int64_t ic = 0; ic < nek1; ++ic) {
-+                const float mv = mp ? slope*GGML_CPU_FP16_TO_FP32(mp[ic]) : 0.0f;
-+                if (mv == -INFINITY) {
-+                    KQ_vals[ic] = -FLT_MAX/2.0f;
-+                    continue;
-+                }
-+                // Match GPU's FP32 dot product with warp butterfly reduction
-+                // GPU: each of 32 threads accumulates D/32 products, then butterfly
-+                const char * k_data = (const char *) k->data + (ic*nbk1 + ik2*nbk2 + ik3*nbk3);
-+                const ggml_fp16_t * k_f16 = (const ggml_fp16_t *) k_data;
++            const int ne11_total = (int)(ic_end - ic_start);
 +
-+                // Compute per-"thread" partial sums (32 partials, each summing DK/32 products)
-+                float partials[32];
-+                for (int t = 0; t < WARP_SIZE; t++) {
-+                    float sum = 0.0f;
-+                    // GPU processes float2 pairs: 2 elements per loop iteration
-+                    for (int k0 = 0; k0 < DK/2; k0 += WARP_SIZE) {
-+                        int idx = 2*(k0 + t);
-+                        // GPU: sum += __low2float(K_h2) * Q_f2.x + __high2float(K_h2) * Q_f2.y
-+                        sum += GGML_CPU_FP16_TO_FP32(k_f16[idx])   * Q_scaled[idx];
-+                        sum += GGML_CPU_FP16_TO_FP32(k_f16[idx+1]) * Q_scaled[idx+1];
-+                    }
-+                    partials[t] = sum;
-+                }
-+                // Butterfly reduction matching warp_reduce_sum
-+                float buf[2][32];
-+                memcpy(buf[0], partials, 32 * sizeof(float));
-+                int cur = 0;
-+                for (int offset = WARP_SIZE/2; offset > 0; offset >>= 1) {
-+                    int nxt = 1 - cur;
-+                    for (int lane = 0; lane < WARP_SIZE; lane++)
-+                        buf[nxt][lane] = buf[cur][lane] + buf[cur][lane ^ offset];
-+                    cur = nxt;
-+                }
-+                float s = buf[cur][0];
-+
-+                if (logit_softcap != 0.0f) s = logit_softcap*tanhf(s);
-+                s += mv;
-+                KQ_vals[ic] = s;
-+            }
-+
-+            // Phase 2: Find max (matching GPU tile structure)
-+            // GPU processes D=128 positions per tile, finds max within tile via warp reduction
-+            {
-+                const int D_tile = DK; // tile size = head dim = 128
-+                M = -FLT_MAX/2.0f;
-+                for (int64_t ic = 0; ic < nek1; ++ic) {
-+                    M = fmaxf(M, KQ_vals[ic]);
-+                }
-+            }
-+
-+            // Phase 3: Compute softmax weights
-+            for (int64_t ic = 0; ic < nek1; ++ic) {
-+                KQ_vals[ic] = expf_det(KQ_vals[ic] - M);
-+            }
-+
-+            // Phase 3b: Sum weights matching GPU's butterfly reduction
-+            // GPU has D=128 threads, each with one weight per tile.
-+            // After all tiles, kqsum reduced with warp butterfly then inter-warp butterfly.
-+            // For single tile (nek1 <= D), match by placing weights in D-element array
-+            // and butterfly reducing.
-+            {
-+                const int D_tile = DK; // 128
-+                float kq_buf[2][256]; // D_tile max 256
-+                // Place weights into tile-sized array (zeros for unused positions)
-+                for (int i = 0; i < D_tile; i++) {
-+                    kq_buf[0][i] = (i < nek1) ? KQ_vals[i] : 0.0f;
-+                }
-+                // Butterfly reduction matching warp_reduce_sum + inter-warp reduce
-+                // First: per-warp butterfly (4 warps of 32)
-+                const int nwarps = D_tile / WARP_SIZE;
-+                float warp_sums[8]; // max nwarps
++            for (int k_VKQ_0 = 0; k_VKQ_0 < ne11_total; k_VKQ_0 += nthreads_tot) {
 +                for (int w = 0; w < nwarps; w++) {
-+                    float wbuf[2][32];
-+                    memcpy(wbuf[0], &kq_buf[0][w*WARP_SIZE], WARP_SIZE * sizeof(float));
-+                    int cur = 0;
-+                    for (int off = WARP_SIZE/2; off > 0; off >>= 1) {
-+                        int nxt = 1 - cur;
-+                        for (int lane = 0; lane < WARP_SIZE; lane++)
-+                            wbuf[nxt][lane] = wbuf[cur][lane] + wbuf[cur][lane ^ off];
-+                        cur = nxt;
++                    const int warp_base = k_VKQ_0 + w * warp_sz;
++
++                    // Compute 32 KQ values with nthreads_KQ=8 butterfly
++                    float kq_vals[32];
++                    float KQ_max_new = KQ_max_pw[w];
++
++                    for (int i = 0; i < warp_sz; i++) {
++                        const int ic = (int)ic_start + warp_base + i;
++                        if (ic >= (int)ic_end) { kq_vals[i] = -INFINITY; continue; }
++                        const float mv = mp ? slope*GGML_CPU_FP16_TO_FP32(mp[ic]) : 0.0f;
++                        if (mv == -INFINITY) { kq_vals[i] = -INFINITY; continue; }
++
++                        const ggml_fp16_t * k_f16 = (const ggml_fp16_t *)((const char *)k->data + ic*nbk1 + ik2*nbk2 + ik3*nbk3);
++
++                        float partials[8];
++                        for (int t = 0; t < nthreads_KQ; t++) {
++                            float sum = 0.0f;
++                            for (int kk = 0; kk < DK/2; kk += nthreads_KQ * cpy_ne) {
++                                for (int k1 = 0; k1 < cpy_ne; k1++) {
++                                    int f = 2*(kk + t*cpy_ne + k1);
++                                    if (f + 1 < DK) {
++                                        sum += GGML_CPU_FP16_TO_FP32(k_f16[f])   * Q_scaled[f];
++                                        sum += GGML_CPU_FP16_TO_FP32(k_f16[f+1]) * Q_scaled[f+1];
++                                    }
++                                }
++                            }
++                            partials[t] = sum;
++                        }
++                        {
++                            float rb[2][8];
++                            memcpy(rb[0], partials, 8 * sizeof(float));
++                            int c = 0;
++                            for (int off = 4; off > 0; off >>= 1) {
++                                int n = 1 - c;
++                                for (int lane = 0; lane < 8; lane++)
++                                    rb[n][lane] = rb[c][lane] + rb[c][lane ^ off];
++                                c = n;
++                            }
++                            partials[0] = rb[c][0];
++                        }
++                        float s_kq = partials[0];
++                        if (logit_softcap != 0.0f) s_kq = logit_softcap*tanhf(s_kq);
++                        s_kq += mv;
++                        kq_vals[i] = s_kq;
++                        KQ_max_new = fmaxf(KQ_max_new, s_kq + FATTN_KQ_MAX_OFFSET);
 +                    }
-+                    warp_sums[w] = wbuf[cur][0];
++
++                    // Rescale existing VKQ partials for this warp
++                    const float KQ_max_scale = expf_det(KQ_max_pw[w] - KQ_max_new);
++                    KQ_max_pw[w] = KQ_max_new;
++
++                    for (int vi = 0; vi < V_cols_per_iter; vi++)
++                        for (int64_t d = 0; d < DV; d++)
++                            VKQ_pw[w][vi][d] *= KQ_max_scale;
++
++                    // Softmax values
++                    float KQ_sm[32];
++                    for (int i = 0; i < warp_sz; i++)
++                        KQ_sm[i] = (kq_vals[i] > -INFINITY) ? expf_det(kq_vals[i] - KQ_max_pw[w]) : 0.0f;
++
++                    // Per-thread KQ_sum: GPU does fma(old_sum, scale, softmax_val)
++                    for (int tid = 0; tid < warp_sz; tid++)
++                        KQ_sum_pt[w][tid] = fmaf(KQ_sum_pt[w][tid], KQ_max_scale, KQ_sm[tid]);
++
++                    // V accumulation in stride-V_cols_per_iter order matching GPU k0 loop
++                    for (int k0 = 0; k0 < warp_sz; k0 += V_cols_per_iter) {
++                        for (int vi = 0; vi < V_cols_per_iter; vi++) {
++                            const int kk = k0 + vi;
++                            const int ic = (int)ic_start + warp_base + kk;
++                            if (ic >= (int)ic_end) continue;
++
++                            const float KQ_k = KQ_sm[kk];
++                            if (KQ_k == 0.0f) continue;
++
++                            const char * v_data = (const char *)v->data + (ic*nbv1 + iv2*nbv2 + iv3*nbv3);
++
++                            if (v->type == GGML_TYPE_F16) {
++                                const ggml_fp16_t * v_f16 = (const ggml_fp16_t *)v_data;
++                                for (int64_t d = 0; d < DV; d += 2) {
++                                    VKQ_pw[w][vi][d]   = fmaf(GGML_CPU_FP16_TO_FP32(v_f16[d]),   KQ_k, VKQ_pw[w][vi][d]);
++                                    VKQ_pw[w][vi][d+1] = fmaf(GGML_CPU_FP16_TO_FP32(v_f16[d+1]), KQ_k, VKQ_pw[w][vi][d+1]);
++                                }
++                            } else if (v_to_float) {
++                                v_to_float(v_data, V32, DV);
++                                for (int64_t d = 0; d < DV; d += 2) {
++                                    VKQ_pw[w][vi][d]   = fmaf(V32[d],   KQ_k, VKQ_pw[w][vi][d]);
++                                    VKQ_pw[w][vi][d+1] = fmaf(V32[d+1], KQ_k, VKQ_pw[w][vi][d+1]);
++                                }
++                            } else {
++                                const float * v_f32 = (const float *)v_data;
++                                for (int64_t d = 0; d < DV; d += 2) {
++                                    VKQ_pw[w][vi][d]   = fmaf(v_f32[d],   KQ_k, VKQ_pw[w][vi][d]);
++                                    VKQ_pw[w][vi][d+1] = fmaf(v_f32[d+1], KQ_k, VKQ_pw[w][vi][d+1]);
++                                }
++                            }
++                        }
++                    }
 +                }
-+                // Then: inter-warp butterfly
-+                // GPU: kqsum_shared[threadIdx.x] loaded, then warp_reduce_sum
-+                float ibuf[2][32];
-+                for (int i = 0; i < WARP_SIZE; i++) ibuf[0][i] = (i < nwarps) ? warp_sums[i] : 0.0f;
-+                int cur = 0;
-+                for (int off = WARP_SIZE/2; off > 0; off >>= 1) {
-+                    int nxt = 1 - cur;
-+                    for (int lane = 0; lane < WARP_SIZE; lane++)
-+                        ibuf[nxt][lane] = ibuf[cur][lane] + ibuf[cur][lane ^ off];
-+                    cur = nxt;
-+                }
-+                S = ibuf[cur][0];
 +            }
 +
-+            // Phase 4: Accumulate V (matching GPU: for each k, VKQ[tid] += V_ki * KQ[k])
++            // Inter-warp reduction: rescale all warps to global max
++            float global_max = -FLT_MAX / 2.0f;
++            for (int w = 0; w < nwarps; w++)
++                global_max = fmaxf(global_max, KQ_max_pw[w]);
++
++            for (int w = 0; w < nwarps; w++) {
++                const float kqmax_scale = expf_det(KQ_max_pw[w] - global_max);
++                for (int vi = 0; vi < V_cols_per_iter; vi++)
++                    for (int64_t d = 0; d < DV; d++)
++                        VKQ_pw[w][vi][d] *= kqmax_scale;
++                for (int tid = 0; tid < warp_sz; tid++)
++                    KQ_sum_pt[w][tid] *= kqmax_scale;
++            }
++
++            // Per-warp KQ_sum via 32-wide butterfly (matching GPU warp_reduce_sum)
++            float KQ_sum_warp[4];
++            for (int w = 0; w < nwarps; w++) {
++                float rb[2][32];
++                memcpy(rb[0], KQ_sum_pt[w], 32*sizeof(float));
++                int c = 0;
++                for (int off = 16; off > 0; off >>= 1) {
++                    int n = 1-c;
++                    for (int lane = 0; lane < 32; lane++)
++                        rb[n][lane] = rb[c][lane] + rb[c][lane^off];
++                    c = n;
++                }
++                KQ_sum_warp[w] = rb[c][0];
++            }
++
++            // Inter-warp KQ_sum: butterfly of [sum0..sum3, 0..0] matching GPU
++            {
++                float rb[2][32];
++                memset(rb[0], 0, 32*sizeof(float));
++                for (int w = 0; w < nwarps; w++) rb[0][w] = KQ_sum_warp[w];
++                int c = 0;
++                for (int off = 16; off > 0; off >>= 1) {
++                    int n = 1-c;
++                    for (int lane = 0; lane < 32; lane++)
++                        rb[n][lane] = rb[c][lane] + rb[c][lane^off];
++                    c = n;
++                }
++                S = rb[c][0];
++            }
++
++            // Final VKQ sum: w then v order matching GPU's nested loop
++            M = global_max;
 +            memset(VKQ32, 0, DV*sizeof(float));
-+            for (int64_t ic = 0; ic < nek1; ++ic) {
-+                if (KQ_vals[ic] == 0.0f) continue;
-+                const char * v_data = ((const char *) v->data + (ic*nbv1 + iv2*nbv2 + iv3*nbv3));
-+                if (v->type == GGML_TYPE_F16) {
-+                    for (int64_t d = 0; d < DV; ++d) {
-+                        VKQ32[d] += GGML_CPU_FP16_TO_FP32(((const ggml_fp16_t *) v_data)[d]) * KQ_vals[ic];
-+                    }
-+                } else if (v_to_float) {
-+                    float V_tmp[256];
-+                    v_to_float(v_data, V_tmp, DV);
-+                    for (int64_t d = 0; d < DV; ++d) VKQ32[d] += V_tmp[d] * KQ_vals[ic];
-+                } else {
-+                    for (int64_t d = 0; d < DV; ++d) VKQ32[d] += ((const float *) v_data)[d] * KQ_vals[ic];
-+                }
-+            }
++            for (int w = 0; w < nwarps; w++)
++                for (int vi = 0; vi < V_cols_per_iter; vi++)
++                    for (int64_t d = 0; d < DV; d++)
++                        VKQ32[d] += VKQ_pw[w][vi][d];
 +
-+            goto det_finalize;
++            goto det_attn_finalize;
 +        }
 +
          // online softmax / attention
          // loop over n_kv and n_head_kv
          // ref: https://arxiv.org/pdf/2112.05682.pdf
-@@ -8840,7 +9077,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
+@@ -8310,43 +8650,30 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
  
-             const char * v_data = ((const char *) v->data + (ic*nbv1 + iv2*nbv2 + iv3*nbv3));
- 
--            if (v->type == GGML_TYPE_F16) {
-+            if (v->type == GGML_TYPE_F16 && !det_f32_accum) {
+             if (v->type == GGML_TYPE_F16) {
                  if (s > M) {
-                     // s is new maximum, ms < 1.0f, vs == expf(s - s) == 1.0f
+-                    // s is new maximum, ms < 1.0f, vs == expf(s - s) == 1.0f
                      M = s;
-@@ -8855,6 +9092,20 @@ static void ggml_compute_forward_flash_attn_ext_f16(
- 
-                 // V += v*expf(s - M)
+-                    ms = expf(Mold - M);
+-
+-                    // V = V*expf(Mold - M)
++                    ms = ggml_is_deterministic() ? expf_det(Mold - M) : expf(Mold - M);
+                     ggml_vec_scale_f16(DV, VKQ16, ms);
+                 } else {
+-                    // no new maximum, ms == 1.0f, vs != 1.0f
+-                    vs = expf(s - M);
++                    vs = ggml_is_deterministic() ? expf_det(s - M) : expf(s - M);
+                 }
+-
+-                // V += v*expf(s - M)
                  ggml_vec_mad_f16(DV, VKQ16, (const ggml_fp16_t *) v_data, vs);
-+            } else if (det_f32_accum) {
-+                // Deterministic: FP16 V but FP32 accumulation to match GPU
-+                if (s > M) {
-+                    M = s;
-+                    ms = expf_det(Mold - M);
-+                    ggml_vec_scale_f32(DV, VKQ32, ms);
-+                } else {
-+                    vs = expf_det(s - M);
-+                }
-+                // Convert FP16 V to FP32 then accumulate
-+                for (int64_t d = 0; d < DV; ++d) {
-+                    V32[d] = GGML_CPU_FP16_TO_FP32(((const ggml_fp16_t *) v_data)[d]);
-+                }
-+                ggml_vec_mad_f32(DV, VKQ32, V32, vs);
              } else {
                  if (s > M) {
-                     // s is new maximum, ms < 1.0f, vs == expf(s - s) == 1.0f
-@@ -8881,12 +9132,13 @@ static void ggml_compute_forward_flash_attn_ext_f16(
-             S = S*ms + vs; // scale and increment sum with partial sum
-         }
- 
--        if (v->type == GGML_TYPE_F16) {
-+        if (v->type == GGML_TYPE_F16 && !det_f32_accum) {
-             for (int64_t d = 0; d < DV; ++d) {
-                 VKQ32[d] = GGML_CPU_FP16_TO_FP32(VKQ16[d]);
+-                    // s is new maximum, ms < 1.0f, vs == expf(s - s) == 1.0f
+                     M = s;
+-                    ms = expf(Mold - M);
+-
+-                    // V = V*expf(Mold - M)
++                    ms = ggml_is_deterministic() ? expf_det(Mold - M) : expf(Mold - M);
+                     ggml_vec_scale_f32(DV, VKQ32, ms);
+                 } else {
+-                    // no new maximum, ms == 1.0f, vs != 1.0f
+-                    vs = expf(s - M);
++                    vs = ggml_is_deterministic() ? expf_det(s - M) : expf(s - M);
+                 }
+-
+-                // V += v*expf(s - M)
+                 if (v_to_float) {
+                     v_to_float(v_data, V32, DV);
+                     ggml_vec_mad_f32(DV, VKQ32, V32, vs);
+                 } else {
+-                    // V is F32
+                     ggml_vec_mad_f32(DV, VKQ32, (const float *) v_data, vs);
+                 }
              }
+ 
+-            S = S*ms + vs; // scale and increment sum with partial sum
++            S = S*ms + vs;
          }
  
-+det_finalize:
-         // sinks
-         if (sinks) {
-             const float s = ((float *)((char *) sinks->data))[h];
-@@ -8895,18 +9147,24 @@ static void ggml_compute_forward_flash_attn_ext_f16(
+         if (v->type == GGML_TYPE_F16) {
+@@ -8363,27 +8690,29 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
              float vs = 1.0f;
  
              if (s > M) {
 -                ms = expf(M - s);
 +                ms = ggml_is_deterministic() ? expf_det(M - s) : expf(M - s);
+                 M = s;
                  ggml_vec_scale_f32(DV, VKQ32, ms);
              } else {
 -                vs = expf(s - M);
@@ -761,25 +1194,117 @@ index 212e52ef..4c640e76 100644
              S = S*ms + vs;
          }
  
-         // V /= S
--        const float S_inv = 1.0f/S;
--        ggml_vec_scale_f32(DV, VKQ32, S_inv);
-+        // GPU: dst_val /= kqsum (direct divide)
-+        // CPU: 1/S then multiply — two roundings, differs by 1 ULP
-+        if (ggml_is_deterministic()) {
-+            for (int64_t d = 0; d < DV; ++d) VKQ32[d] /= S;
-+        } else {
-+            const float S_inv = 1.0f/S;
-+            ggml_vec_scale_f32(DV, VKQ32, S_inv);
-+        }
++det_attn_finalize:
+         if (write_partials) {
+-            // Write M, S, VKQ to partials for later reduction
+-            // partials layout: [M, S, VKQ[DV]] per query head
+             float * partial = partials + ir * partial_stride;
+             partial[0] = M;
+             partial[1] = S;
+             memcpy(partial + 2, VKQ32, DV * sizeof(float));
+         } else {
+-            // V /= S
+-            const float S_inv = S == 0.0f ? 0.0f : 1.0f/S;
+-            ggml_vec_scale_f32(DV, VKQ32, S_inv);
++            if (ggml_is_deterministic()) {
++                for (int64_t d = 0; d < DV; ++d) VKQ32[d] /= S;
++            } else {
++                const float S_inv = S == 0.0f ? 0.0f : 1.0f/S;
++                ggml_vec_scale_f32(DV, VKQ32, S_inv);
++            }
  
-         // dst indices
-         const int i1 = iq1;
+             // dst indices
+             const int i1 = iq1;
+@@ -9286,8 +9615,14 @@ static void ggml_compute_forward_ssm_conv_f32(
+                 float sumf = 0.0f;
+ 
+                 // d_conv
+-                for (int i0 = 0; i0 < nc; ++i0) {
+-                    sumf += s[i0 + i1*ncs] * c[i0 + i1*nc];
++                if (ggml_is_deterministic()) {
++                    for (int i0 = 0; i0 < nc; ++i0) {
++                        sumf = fmaf(s[i0 + i1*ncs], c[i0 + i1*nc], sumf);
++                    }
++                } else {
++                    for (int i0 = 0; i0 < nc; ++i0) {
++                        sumf += s[i0 + i1*ncs] * c[i0 + i1*nc];
++                    }
+                 }
+                 x[i1] = sumf;
+             }
+@@ -9373,8 +9708,8 @@ static void ggml_compute_forward_ssm_scan_f32(
+                 // n_head
+                 for (int h = ih0; h < ih1; ++h) {
+                     // ref: https://github.com/state-spaces/mamba/blob/62db608da60f6fc790b8ed9f4b3225e95ca15fde/mamba_ssm/ops/triton/softplus.py#L16
+-                    const float dt_soft_plus = ggml_compute_softplus_f32(dt[h]);
+-                    const float dA = expf(dt_soft_plus * A[h]);
++                    const float dt_soft_plus = ggml_is_deterministic() ? softplus_det(dt[h]) : ggml_compute_softplus_f32(dt[h]);
++                    const float dA = ggml_is_deterministic() ? expf_det(dt_soft_plus * A[h]) : expf(dt_soft_plus * A[h]);
+                     const int g = h / (nh / ng); // repeat_interleave
+ 
+                     // dim
+@@ -9470,7 +9805,7 @@ static void ggml_compute_forward_ssm_scan_f32(
+                 // n_head
+                 for (int h = ih0; h < ih1; ++h) {
+                     // ref: https://github.com/state-spaces/mamba/blob/62db608da60f6fc790b8ed9f4b3225e95ca15fde/mamba_ssm/ops/triton/softplus.py#L16
+-                    const float dt_soft_plus = ggml_compute_softplus_f32(dt[h]);
++                    const float dt_soft_plus = ggml_is_deterministic() ? softplus_det(dt[h]) : ggml_compute_softplus_f32(dt[h]);
+                     const int g = h / (nh / ng); // repeat_interleave
+ 
+                     // dim
+@@ -9509,7 +9844,8 @@ static void ggml_compute_forward_ssm_scan_f32(
+                             const int i = i0 + ii*nc;
+                             const int ig = i0 + g*nc;
+                             // state = prev_state * dA + dB * x
+-                            const float state = (s0[i] * expf(dt_soft_plus * A[i0 + h*nc])) + (B[ig] * x_dt);
++                            const float dA_i = ggml_is_deterministic() ? expf_det(dt_soft_plus * A[i0 + h*nc]) : expf(dt_soft_plus * A[i0 + h*nc]);
++                            const float state = (s0[i] * dA_i) + (B[ig] * x_dt);
+                             // y = rowwise_dotprod(state, C)
+                             sumf += state * C[ig];
+                             s[i] = state;
+@@ -10399,7 +10735,6 @@ static void ggml_compute_forward_solve_tri_f32(const struct ggml_compute_params
+ 
+         const float * A_batch = A + i02 * nb02 / sizeof(float) + i03 * nb03 / sizeof(float);
+         const float * B_batch = B + i02 * nb12 / sizeof(float) + i03 * nb13 / sizeof(float);
+-
+         float * X_batch = X + i02 * nb2 / sizeof(float) + i03 * nb3 / sizeof(float);
+ 
+         for (int64_t i00 = 0; i00 < n; ++i00) {
+@@ -10407,11 +10742,7 @@ static void ggml_compute_forward_solve_tri_f32(const struct ggml_compute_params
+             for (int64_t t = 0; t < i00; ++t) {
+                 sum += A_batch[i00 * n + t] * X_batch[t * k + i01];
+             }
+-
+-            const float diag = A_batch[i00 * n + i00];
+-            assert(diag != 0.0f && "Zero diagonal in triangular matrix");
+-
+-            X_batch[i00 * k + i01] = (B_batch[i00 * k + i01] - sum) / diag;
++            X_batch[i00 * k + i01] = (B_batch[i00 * k + i01] - sum) / A_batch[i00 * n + i00];
+         }
+     }
+ }
+@@ -10523,14 +10854,14 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
+             if (kda) {
+                 // precompute exp(g) into delta scratch (reused below)
+                 for (int64_t i = 0; i < S_v; ++i) {
+-                    delta[i] = expf(g_d[i]);
++                    delta[i] = expf_det(g_d[i]);
+                 }
+                 // S[i][:] *= exp(g[i]) => for each row j of M: M[j][i] *= exp(g[i])
+                 for (int64_t j = 0; j < S_v; ++j) {
+                     ggml_vec_mul_f32(S_v, &s_out[j * S_v], &s_out[j * S_v], delta);
+                 }
+             } else {
+-                ggml_vec_scale_f32(S_v * S_v, s_out, expf(g_d[0]));
++                ggml_vec_scale_f32(S_v * S_v, s_out, expf_det(g_d[0]));
+             }
+ 
+             // delta[j] = sum_i S[i][j] * k[i] = dot(row j of M, k)
 diff --git a/ggml/src/ggml-cpu/quants.c b/ggml/src/ggml-cpu/quants.c
-index 365cb36d..7072152a 100644
+index 7ebbb9c6..d19cfbd0 100644
 --- a/ggml/src/ggml-cpu/quants.c
 +++ b/ggml/src/ggml-cpu/quants.c
-@@ -622,6 +622,100 @@ void ggml_vec_dot_q4_K_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, c
+@@ -662,6 +662,168 @@ void ggml_vec_dot_q4_K_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, c
      *s = sumf;
  }
  
@@ -877,10 +1402,78 @@ index 365cb36d..7072152a 100644
 +    *s = buf[cur][0];
 +}
 +
++// Deterministic F32 dot product matching GPU mmvf kernel accumulation order.
++// GPU: block_size threads, each accumulates n/(2*block_size) float2 pairs, then warp+inter-warp reduce.
++void ggml_vec_dot_f32_det(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
++    assert(nrc == 1);
++    UNUSED(nrc); UNUSED(bx); UNUSED(by); UNUSED(bs);
++
++    const float * x = vx;
++    const float * y = vy;
++    const int ncols2 = n / 2;
++
++    // Match GPU: block_size chosen to minimize iterations (same heuristic as mmvf.cu)
++    int block_size = 32;
++    for (int bs_try = 64; bs_try <= 256; bs_try += 32) {
++        if ((ncols2 + bs_try - 1) / bs_try < (ncols2 + block_size - 1) / block_size)
++            block_size = bs_try;
++    }
++
++    const int WARP_SIZE = 32;
++    const int nwarps = block_size / WARP_SIZE;
++
++    // Phase 1: per-thread accumulation (float2 pairs)
++    float tmp[256]; // max block_size
++    for (int tid = 0; tid < block_size; tid++) {
++        float sum = 0.0f;
++        for (int col2 = tid; col2 < ncols2; col2 += block_size) {
++            sum += x[2*col2]   * y[2*col2];
++            sum += x[2*col2+1] * y[2*col2+1];
++        }
++        tmp[tid] = sum;
++    }
++
++    // Phase 2: warp butterfly reduction
++    float warp_sums[8]; // max nwarps
++    for (int w = 0; w < nwarps; w++) {
++        float buf[2][32];
++        memcpy(buf[0], &tmp[w * WARP_SIZE], WARP_SIZE * sizeof(float));
++        int cur = 0;
++        for (int off = WARP_SIZE/2; off > 0; off >>= 1) {
++            int nxt = 1 - cur;
++            for (int lane = 0; lane < WARP_SIZE; lane++)
++                buf[nxt][lane] = buf[cur][lane] + buf[cur][lane ^ off];
++            cur = nxt;
++        }
++        warp_sums[w] = buf[cur][0];
++    }
++
++    // Phase 3: inter-warp reduction (warp 0 accumulates, then butterfly)
++    if (nwarps > 1) {
++        float iw = warp_sums[0];
++        for (int w = 1; w < nwarps; w++) iw += warp_sums[w];
++        // GPU does: buf_iw[tid/warp_size] = sumf; then warp 0 reads buf_iw[tid] and reduces
++        // For nwarps <= 32, this is equivalent to sequential add then one more butterfly
++        // But the GPU's inter-warp is: load nwarps values into warp 0's lanes, butterfly
++        float ibuf[2][32];
++        for (int i = 0; i < WARP_SIZE; i++) ibuf[0][i] = (i < nwarps) ? warp_sums[i] : 0.0f;
++        int cur = 0;
++        for (int off = WARP_SIZE/2; off > 0; off >>= 1) {
++            int nxt = 1 - cur;
++            for (int lane = 0; lane < WARP_SIZE; lane++)
++                ibuf[nxt][lane] = ibuf[cur][lane] + ibuf[cur][lane ^ off];
++            cur = nxt;
++        }
++        *s = ibuf[cur][0];
++    } else {
++        *s = warp_sums[0];
++    }
++}
++
  void ggml_vec_dot_q5_K_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy,  size_t by, int nrc) {
      assert(n % QK_K == 0);
      assert(nrc == 1);
-@@ -757,6 +851,88 @@ void ggml_vec_dot_q6_K_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, c
+@@ -797,6 +959,388 @@ void ggml_vec_dot_q6_K_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, c
      *s = sumf;
  }
  
@@ -966,24 +1559,373 @@ index 365cb36d..7072152a 100644
 +    *s = buf[cur][0];
 +}
 +
++// Q8_0 x Q8_1 deterministic dot product — matches GPU mmvq kernel
++// GPU: nwarps=4, 128 threads, qi=8, vdr=2, 4 threads per block (each handles 8 bytes)
++void ggml_vec_dot_q8_0_q8_1_det(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
++    assert(n % QK8_0 == 0);
++    assert(nrc == 1);
++    UNUSED(nrc); UNUSED(bx); UNUSED(by); UNUSED(bs);
++
++    const block_q8_0 * GGML_RESTRICT x = vx;
++    const block_q8_1 * GGML_RESTRICT y = vy;
++    const int nb = n / QK8_0;
++
++    const int nwarps = 4, warp_sz = 32, nthreads = nwarps * warp_sz; // 128
++    const int qi = 8, vdr = 2;
++    const int threads_per_block = qi / vdr; // 4
++    const int blocks_per_iter = vdr * nthreads / qi; // 32
++
++    float tmp[128];
++    for (int tid = 0; tid < nthreads; tid++) {
++        float acc = 0.0f;
++        int kqs = vdr * (tid % threads_per_block); // 0,2,4,6
++        for (int kbx = tid / threads_per_block; kbx < nb; kbx += blocks_per_iter) {
++            // Each thread handles vdr=2 int32 words starting at kqs
++            // dp4a: 4 int8 products per word
++            int sumi = 0;
++            for (int i = 0; i < vdr; i++) {
++                int byte_off = (kqs + i) * 4; // 4 bytes per int32
++                for (int b = 0; b < 4; b++)
++                    sumi += (int)x[kbx].qs[byte_off + b] * (int)y[kbx].qs[byte_off + b];
++            }
++            float d0 = GGML_CPU_FP16_TO_FP32(x[kbx].d);
++            float d1 = GGML_CPU_FP16_TO_FP32(y[kbx].d);
++            acc += d0 * d1 * (float)sumi;
++        }
++        tmp[tid] = acc;
++    }
++
++    // Inter-warp: warp 1+ store to shared, warp 0 collects
++    for (int w = 1; w < nwarps; w++)
++        for (int lane = 0; lane < warp_sz; lane++)
++            tmp[lane] += tmp[w * warp_sz + lane];
++
++    // Warp 0 butterfly reduction
++    float buf[2][32];
++    memcpy(buf[0], tmp, warp_sz * sizeof(float));
++    int cur = 0;
++    for (int off = 16; off > 0; off >>= 1) {
++        int nxt = 1 - cur;
++        for (int lane = 0; lane < warp_sz; lane++)
++            buf[nxt][lane] = buf[cur][lane] + buf[cur][lane ^ off];
++        cur = nxt;
++    }
++    *s = buf[cur][0];
++}
++
++// IQ4_NL x Q8_1 deterministic dot product — matches GPU vec_dot_iq4_nl_q8_1
++void ggml_vec_dot_iq4_nl_q8_1_det(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
++    assert(n % QK4_NL == 0);
++    assert(nrc == 1);
++    UNUSED(nrc); UNUSED(bx); UNUSED(by); UNUSED(bs);
++
++    const block_iq4_nl * GGML_RESTRICT x = vx;
++    const block_q8_1   * GGML_RESTRICT y = vy;
++    const int nb = n / QK4_NL;
++
++    const int nthreads = 32;
++    float thread_acc[32];
++    for (int tid = 0; tid < nthreads; tid++) {
++        float acc = 0.0f;
++        for (int kbx = tid; kbx < nb; kbx += nthreads) {
++            int sumi = 0;
++            for (int j = 0; j < QK4_NL/2; j++) {
++                const uint8_t q = x[kbx].qs[j];
++                sumi += kvalues_iq4nl[q & 0xF] * (int)y[kbx].qs[2*j];
++                sumi += kvalues_iq4nl[q >> 4]  * (int)y[kbx].qs[2*j+1];
++            }
++            float d = GGML_CPU_FP16_TO_FP32(x[kbx].d) * GGML_CPU_FP16_TO_FP32(y[kbx].d);
++            acc += d * (float)sumi;
++        }
++        thread_acc[tid] = acc;
++    }
++    float buf[2][32];
++    memcpy(buf[0], thread_acc, 32 * sizeof(float));
++    int cur = 0;
++    for (int off = 16; off > 0; off >>= 1) {
++        int nxt = 1 - cur;
++        for (int lane = 0; lane < 32; lane++)
++            buf[nxt][lane] = buf[cur][lane] + buf[cur][lane ^ off];
++        cur = nxt;
++    }
++    *s = buf[cur][0];
++}
++
++// CPU emulation of get_int_from_table_16: takes int32 of 8 packed nibbles,
++// looks up each nibble in table, returns {even_bytes, odd_bytes} as two int32
++static void cpu_get_int_from_table_16(uint32_t q4, const int8_t * table, int32_t * out_x, int32_t * out_y) {
++    // q4 contains 8 nibbles (4 bits each)
++    // GPU splits into even-indexed bytes (v.x) and odd-indexed bytes (v.y)
++    int8_t vals[8];
++    for (int i = 0; i < 8; i++)
++        vals[i] = table[(q4 >> (4*i)) & 0xF];
++    // v.x = bytes 0,2,4,6 (even); v.y = bytes 1,3,5,7 (odd)
++    uint8_t xb[4] = { (uint8_t)vals[0], (uint8_t)vals[2], (uint8_t)vals[4], (uint8_t)vals[6] };
++    uint8_t yb[4] = { (uint8_t)vals[1], (uint8_t)vals[3], (uint8_t)vals[5], (uint8_t)vals[7] };
++    memcpy(out_x, xb, 4);
++    memcpy(out_y, yb, 4);
++}
++
++// CPU dp4a: dot product of 4 signed int8 values packed in int32
++static int32_t cpu_dp4a(int32_t a, int32_t b, int32_t c) {
++    const int8_t * va = (const int8_t *)&a;
++    const int8_t * vb = (const int8_t *)&b;
++    return c + (int)va[0]*vb[0] + (int)va[1]*vb[1] + (int)va[2]*vb[2] + (int)va[3]*vb[3];
++}
++
++// IQ4_XS x Q8_1 deterministic dot product — matches GPU vec_dot_iq4_xs_q8_1
++// GPU: qi=32, vdr=4, iqs = 4*(tid%8) → {0,4,8,12,16,20,24,28}
++// kbx = tid/8, increments by blocks_per_iter
++void ggml_vec_dot_iq4_xs_q8_1_det(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
++    assert(n % QK_K == 0);
++    assert(nrc == 1);
++    UNUSED(nrc); UNUSED(bx); UNUSED(by); UNUSED(bs);
++
++    const block_iq4_xs * GGML_RESTRICT x = vx;
++    const block_q8_1   * GGML_RESTRICT y = vy;
++    const int nb = n / QK_K;
++
++    // GPU has nwarps * warp_size threads. For IQ4_XS:
++    // qi/vdr = 32/4 = 8 threads per super-block
++    // blocks_per_iter = vdr * nwarps * 32 / qi = 4 * nwarps
++    // We simulate with a fixed thread count matching the GPU
++    const int nwarps = 4, warp_sz = 32;
++    const int nthreads = nwarps * warp_sz;  // 128
++    const int qi_over_vdr = 8;  // qi/vdr = 32/4
++    const int blocks_per_iter = 4 * nwarps;  // 16
++
++    float thread_acc[128];
++    for (int tid = 0; tid < nthreads; tid++) {
++        float acc = 0.0f;
++        const int iqs = 4 * (tid % qi_over_vdr);  // 0,4,8,12,16,20,24,28
++
++        for (int kbx = tid / qi_over_vdr; kbx < nb; kbx += blocks_per_iter) {
++            const int kby = kbx * (QK_K / QK8_1);  // kbx * 8
++
++            int sumi = 0;
++            for (int j = 0; j < 4; j++) {
++                // get_int_b4(bq4->qs, iqs + j) reads int32 word at index (iqs+j)
++                // Each int32 word contains 8 nibbles = 8 IQ4 values
++                uint32_t aux_q4;
++                memcpy(&aux_q4, &x[kbx].qs[(iqs + j) * 4], 4);
++
++                // Table lookup: convert 8 nibbles to 8 int8 values via kvalues_iq4nl
++                int32_t vx_val, vy_val;
++                cpu_get_int_from_table_16(aux_q4, kvalues_iq4nl, &vx_val, &vy_val);
++
++                // Q8_1 block: bq8_1[iqs/4]
++                const block_q8_1 * yb = &y[kby + iqs/4];
++                int32_t u0, u1;
++                memcpy(&u0, &yb->qs[(j + 0) * 4], 4);  // get_int_b4(qs, j)
++                memcpy(&u1, &yb->qs[(j + 4) * 4], 4);  // get_int_b4(qs, j+4)
++
++                sumi = cpu_dp4a(vx_val, u0, sumi);
++                sumi = cpu_dp4a(vy_val, u1, sumi);
++            }
++
++            // Scale: 6-bit per sub-block
++            int ls = ((x[kbx].scales_l[iqs/8] >> (iqs & 0x04)) & 0x0F)
++                   | (((x[kbx].scales_h >> (iqs/2)) & 0x03) << 4);
++            sumi *= (ls - 32);
++
++            float d = GGML_CPU_FP16_TO_FP32(x[kbx].d) * GGML_CPU_FP16_TO_FP32(y[kby + iqs/4].d);
++            acc += d * (float)sumi;
++        }
++        thread_acc[tid] = acc;
++    }
++    // GPU reduction: warp 0 sequentially adds other warps' values, then butterfly
++    // 1. Each warp stores its per-lane values (already in thread_acc)
++    // 2. Warp 0 (lanes 0-31) adds warps 1,2,3 same-lane values sequentially
++    for (int lane = 0; lane < warp_sz; lane++)
++        for (int w = 1; w < nwarps; w++)
++            thread_acc[lane] += thread_acc[w * warp_sz + lane];
++    // 3. Butterfly within warp 0
++    float buf[2][32];
++    memcpy(buf[0], thread_acc, warp_sz * sizeof(float));
++    int cur = 0;
++    for (int off = warp_sz/2; off > 0; off >>= 1) {
++        int nxt = 1 - cur;
++        for (int lane = 0; lane < warp_sz; lane++)
++            buf[nxt][lane] = buf[cur][lane] + buf[cur][lane ^ off];
++        cur = nxt;
++    }
++    *s = buf[cur][0];
++}
++
++// Q5_K x Q8_1 deterministic dot product — matches GPU vec_dot_q5_K_q8_1
++// GPU: qi=32, vdr=2, iqs = 2*(tid%16) → {0,2,4,...,30}
++// kbx = tid/16, blocks_per_iter = 2*nwarps = 8
++void ggml_vec_dot_q5_K_q8_1_det(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
++    assert(n % QK_K == 0);
++    assert(nrc == 1);
++    UNUSED(nrc); UNUSED(bx); UNUSED(by); UNUSED(bs);
++
++    const block_q5_K * GGML_RESTRICT x = vx;
++    const block_q8_1 * GGML_RESTRICT y = vy;
++    const int nb = n / QK_K;
++
++    const int nwarps = 4, warp_sz = 32;
++    const int nthreads = nwarps * warp_sz;  // 128
++    const int qi_over_vdr = 16;  // qi/vdr = 32/2
++    const int blocks_per_iter = 2 * nwarps;  // vdr * nwarps = 8
++
++    float thread_acc[128];
++    for (int tid = 0; tid < nthreads; tid++) {
++        float acc = 0.0f;
++        const int iqs = 2 * (tid % qi_over_vdr);  // 0,2,4,...,30
++
++        for (int kbx = tid / qi_over_vdr; kbx < nb; kbx += blocks_per_iter) {
++            const int kby = kbx * (QK_K / QK8_1);  // kbx * 8
++
++            // bq8_offset: which pair of Q8_1 blocks (0,2,4,6)
++            const int bq8_offset = 2 * ((iqs/2) / 4);
++
++            // Read vl[2]: two int32 words from qs
++            const int * ql = (const int *)(x[kbx].qs + 16 * bq8_offset + 4 * ((iqs/2)%4));
++            int32_t vl0 = ql[0];
++            int32_t vl1 = ql[4];
++
++            // Read vh[2]: two int32 words from qh, shifted by bq8_offset
++            const int * qh = (const int *)(x[kbx].qh + 4 * ((iqs/2)%4));
++            int32_t vh0 = qh[0] >> bq8_offset;
++            int32_t vh1 = qh[4] >> bq8_offset;
++
++            // Decode scales
++            const uint16_t * scales = (const uint16_t *)x[kbx].scales;
++            uint16_t aux[2];
++            const int j = bq8_offset/2;
++            if (j < 2) {
++                aux[0] = scales[j+0] & 0x3f3f;
++                aux[1] = scales[j+2] & 0x3f3f;
++            } else {
++                aux[0] = ((scales[j+2] >> 0) & 0x0f0f) | ((scales[j-2] & 0xc0c0) >> 2);
++                aux[1] = ((scales[j+2] >> 4) & 0x0f0f) | ((scales[j-0] & 0xc0c0) >> 2);
++            }
++            const uint8_t * sc = (const uint8_t *)aux;
++            const uint8_t * m  = sc + 2;
++
++            // Read Q8_1 data and compute dot products
++            int32_t u[4];  // 2*QR5_K
++            float d8[2];   // QR5_K
++            for (int i = 0; i < 2; i++) {  // QR5_K = 2
++                const block_q8_1 * bq8i = &y[kby + bq8_offset + i];
++                d8[i] = GGML_CPU_FP16_TO_FP32(bq8i->d);
++                const int * q8 = (const int *)bq8i->qs + ((iqs/2)%4);
++                u[2*i+0] = q8[0];
++                u[2*i+1] = q8[4];
++            }
++
++            // impl_vmmq: compute dot products using dp4a
++            float sumf_d = 0.0f, sumf_m = 0.0f;
++            for (int i = 0; i < 2; i++) {
++                // Extract low 4 bits, shifted by 4*i
++                int32_t vl0i = (vl0 >> (4*i)) & 0x0F0F0F0F;
++                int32_t vl1i = (vl1 >> (4*i)) & 0x0F0F0F0F;
++                // Extract high bit, shifted
++                int32_t vh0i = ((vh0 >> i) << 4) & 0x10101010;
++                int32_t vh1i = ((vh1 >> i) << 4) & 0x10101010;
++                // Combine to 5-bit values
++                int32_t v0i = vl0i | vh0i;
++                int32_t v1i = vl1i | vh1i;
++                // dp4a: dot product of 4 int8 pairs
++                int dot1 = cpu_dp4a(v1i, u[2*i+1], cpu_dp4a(v0i, u[2*i+0], 0));
++                int dot2 = cpu_dp4a(0x01010101, u[2*i+1], cpu_dp4a(0x01010101, u[2*i+0], 0));
++
++                sumf_d += d8[i] * (float)(dot1 * sc[i]);
++                sumf_m += d8[i] * (float)(dot2 * m[i]);
++            }
++
++            float dm_d = GGML_CPU_FP16_TO_FP32(x[kbx].d);
++            float dm_m = GGML_CPU_FP16_TO_FP32(x[kbx].dmin);
++            // Match GPU: fmaf(dm_d, sumf_d, -(dm_m * sumf_m))
++            float t = dm_m * sumf_m;
++            acc += fmaf(dm_d, sumf_d, -t);
++        }
++        thread_acc[tid] = acc;
++    }
++    // GPU reduction: warp 0 sequentially adds other warps' values, then butterfly
++    for (int lane = 0; lane < warp_sz; lane++)
++        for (int w = 1; w < nwarps; w++)
++            thread_acc[lane] += thread_acc[w * warp_sz + lane];
++    float buf[2][32];
++    memcpy(buf[0], thread_acc, warp_sz * sizeof(float));
++    int cur = 0;
++    for (int off = warp_sz/2; off > 0; off >>= 1) {
++        int nxt = 1 - cur;
++        for (int lane = 0; lane < warp_sz; lane++)
++            buf[nxt][lane] = buf[cur][lane] + buf[cur][lane ^ off];
++        cur = nxt;
++    }
++    *s = buf[cur][0];
++}
++
  void ggml_vec_dot_iq2_xxs_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
      assert(n % QK_K == 0);
      assert(nrc == 1);
 diff --git a/ggml/src/ggml-cpu/quants.h b/ggml/src/ggml-cpu/quants.h
-index d83eb1b1..d1402bfd 100644
+index 3584aaa4..83f5e337 100644
 --- a/ggml/src/ggml-cpu/quants.h
 +++ b/ggml/src/ggml-cpu/quants.h
-@@ -46,6 +46,8 @@ void ggml_vec_dot_mxfp4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
+@@ -48,6 +48,13 @@ void ggml_vec_dot_nvfp4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
  void ggml_vec_dot_q2_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
  void ggml_vec_dot_q3_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
  void ggml_vec_dot_q4_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 +void ggml_vec_dot_q4_K_q8_1_det(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 +void ggml_vec_dot_q6_K_q8_1_det(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
++void ggml_vec_dot_f32_det(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
++void ggml_vec_dot_q8_0_q8_1_det(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
++void ggml_vec_dot_iq4_nl_q8_1_det(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
++void ggml_vec_dot_iq4_xs_q8_1_det(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
++void ggml_vec_dot_q5_K_q8_1_det(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
  void ggml_vec_dot_q5_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
  void ggml_vec_dot_q6_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
  
+diff --git a/ggml/src/ggml-cpu/unary-ops.cpp b/ggml/src/ggml-cpu/unary-ops.cpp
+index 1d834443..415ebc8e 100644
+--- a/ggml/src/ggml-cpu/unary-ops.cpp
++++ b/ggml/src/ggml-cpu/unary-ops.cpp
+@@ -1,4 +1,6 @@
+ #include "unary-ops.h"
++#include "ggml.h"
++#include "ggml-deterministic.h"
+ 
+ static inline float op_abs(float x) {
+     return fabsf(x);
+@@ -29,6 +31,8 @@ static inline float op_relu(float x) {
+ }
+ 
+ static inline float op_sigmoid(float x) {
++    if (ggml_is_deterministic())
++        return 1.f / (1.f + expf_det(-x));
+     return 1.f / (1.f + expf(-x));
+ }
+ 
+@@ -37,6 +41,8 @@ static inline float op_hardsigmoid(float x) {
+ }
+ 
+ static inline float op_exp(float x) {
++    if (ggml_is_deterministic())
++        return expf_det(x);
+     return expf(x);
+ }
+ 
+@@ -74,10 +80,14 @@ static inline float op_log(float x) {
+ }
+ 
+ static inline float op_expm1(float x) {
++    if (ggml_is_deterministic())
++        return expf_det(x) - 1.0f;
+     return expf(x) - 1.0f;
+ }
+ 
+ static inline float op_softplus(float x) {
++    if (ggml_is_deterministic())
++        return softplus_det(x);
+     return (x > 20.0f) ? x : logf(1.0f + expf(x));
+ }
+ 
 diff --git a/ggml/src/ggml-cpu/vec.cpp b/ggml/src/ggml-cpu/vec.cpp
-index 437192d5..db87d8d0 100644
+index d0e40013..8216d84f 100644
 --- a/ggml/src/ggml-cpu/vec.cpp
 +++ b/ggml/src/ggml-cpu/vec.cpp
 @@ -1,4 +1,5 @@
@@ -992,7 +1934,7 @@ index 437192d5..db87d8d0 100644
  
  #include <cassert>
  
-@@ -337,6 +338,11 @@ void ggml_vec_dot_f16(int n, float * GGML_RESTRICT s, size_t bs, ggml_fp16_t * G
+@@ -394,6 +395,11 @@ void ggml_vec_dot_f16(int n, float * GGML_RESTRICT s, size_t bs, ggml_fp16_t * G
  }
  
  void ggml_vec_silu_f32(const int n, float * y, const float * x) {
@@ -1004,7 +1946,7 @@ index 437192d5..db87d8d0 100644
      int i = 0;
  #if defined(__AVX512F__) && defined(__AVX512DQ__)
      for (; i + 15 < n; i += 16) {
-@@ -367,6 +373,11 @@ void ggml_vec_silu_f32(const int n, float * y, const float * x) {
+@@ -431,6 +437,11 @@ void ggml_vec_silu_f32(const int n, float * y, const float * x) {
  }
  
  void ggml_vec_swiglu_f32(const int n, float * y, const float * x, const float * g) {
@@ -1017,10 +1959,10 @@ index 437192d5..db87d8d0 100644
  #if defined(__AVX512F__) && defined(__AVX512DQ__)
      for (; i + 15 < n; i += 16) {
 diff --git a/ggml/src/ggml-cpu/vec.h b/ggml/src/ggml-cpu/vec.h
-index ef334d08..6ec8df13 100644
+index 3198b33b..de1756e0 100644
 --- a/ggml/src/ggml-cpu/vec.h
 +++ b/ggml/src/ggml-cpu/vec.h
-@@ -953,7 +953,11 @@ inline static void ggml_vec_gelu_quick_f16(const int n, ggml_fp16_t * y, const g
+@@ -1058,7 +1058,11 @@ inline static void ggml_vec_gelu_quick_f16(const int n, ggml_fp16_t * y, const g
  }
  
  // Sigmoid Linear Unit (SiLU) function
@@ -1033,81 +1975,171 @@ index ef334d08..6ec8df13 100644
  }
  inline static ggml_fp16_t ggml_silu_f16(ggml_fp16_t x) {
 diff --git a/ggml/src/ggml-cuda/CMakeLists.txt b/ggml/src/ggml-cuda/CMakeLists.txt
-index d11306d1..923a106e 100644
+index 41986210..64c773b6 100644
 --- a/ggml/src/ggml-cuda/CMakeLists.txt
 +++ b/ggml/src/ggml-cuda/CMakeLists.txt
-@@ -117,7 +117,11 @@ if (CUDAToolkit_FOUND)
+@@ -183,7 +183,12 @@ if (CUDAToolkit_FOUND)
  
      set(CUDA_CXX_FLAGS "")
  
 -    set(CUDA_FLAGS -use_fast_math -extended-lambda)
 +    if (GGML_DETERMINISTIC)
 +        set(CUDA_FLAGS -extended-lambda)
++        add_compile_definitions(GGML_DETERMINISTIC)
 +    else()
 +        set(CUDA_FLAGS -use_fast_math -extended-lambda)
 +    endif()
  
      if (GGML_CUDA_DEBUG)
          list(APPEND CUDA_FLAGS -lineinfo)
-diff --git a/ggml/src/ggml-cuda/fattn-vec-f32.cuh b/ggml/src/ggml-cuda/fattn-vec-f32.cuh
-index b2e41eb4..5d5e0dad 100644
---- a/ggml/src/ggml-cuda/fattn-vec-f32.cuh
-+++ b/ggml/src/ggml-cuda/fattn-vec-f32.cuh
-@@ -1,5 +1,6 @@
+diff --git a/ggml/src/ggml-cuda/fattn-vec.cuh b/ggml/src/ggml-cuda/fattn-vec.cuh
+index f0bd42a5..416795e7 100644
+--- a/ggml/src/ggml-cuda/fattn-vec.cuh
++++ b/ggml/src/ggml-cuda/fattn-vec.cuh
+@@ -1,5 +1,12 @@
  #include "common.cuh"
  #include "fattn-common.cuh"
 +#include "ggml-deterministic.h"
++
++#ifdef GGML_DETERMINISTIC
++#define FATTN_EXPF expf_det
++#else
++#define FATTN_EXPF expf
++#endif
  
- // Currenlty llvm with the amdgcn target dose not support unrolling loops
- // that contain a break that can not be resolved at compile time.
-@@ -252,10 +253,18 @@ static __global__ void flash_attn_vec_ext_f32(
-             float kqmax_new_j = kqmax_shared[j][threadIdx.x];
-             kqmax_new_j = warp_reduce_max(kqmax_new_j);
+ static int ggml_cuda_fattn_vec_get_nthreads_host(const int cc) {
+     return 128;
+@@ -262,6 +269,7 @@ static __global__ void flash_attn_ext_vec(
+                 float sum = vec_dot_KQ(K + i_KQ*nb11, Q_reg[j], Q_i32[j], Q_ds[j]);
+                 sum = warp_reduce_sum<nthreads_KQ>(sum);
+ 
++
+                 if (use_logit_softcap) {
+                     sum = logit_softcap*tanhf(sum);
+                 }
+@@ -284,10 +292,10 @@ static __global__ void flash_attn_ext_vec(
+             for (int offset = nthreads_KQ; offset < WARP_SIZE; offset <<= 1) {
+                 KQ_max_new[j] = fmaxf(KQ_max_new[j], __shfl_xor_sync(0xFFFFFFFF, KQ_max_new[j], offset, WARP_SIZE));
+             }
+-            const float KQ_max_scale = expf(KQ_max[j] - KQ_max_new[j]);
++            const float KQ_max_scale = FATTN_EXPF(KQ_max[j] - KQ_max_new[j]);
+             KQ_max[j] = KQ_max_new[j];
+ 
+-            KQ_reg[j] = expf(KQ_reg[j] - KQ_max[j]);
++            KQ_reg[j] = FATTN_EXPF(KQ_reg[j] - KQ_max[j]);
+             KQ_sum[j] = KQ_sum[j]*KQ_max_scale + KQ_reg[j];
+             KQ[j*nthreads + tid] = KQ_reg[j];
+ 
+@@ -379,10 +387,10 @@ static __global__ void flash_attn_ext_vec(
+             }
+ 
+             const float kqmax_new_j = fmaxf(sink, KQ_max[j]);
+-            const float KQ_max_scale = expf(KQ_max[j] - kqmax_new_j);
++            const float KQ_max_scale = FATTN_EXPF(KQ_max[j] - kqmax_new_j);
+             KQ_max[j] = kqmax_new_j;
+ 
+-            KQ_sum[j] = KQ_sum[j]*KQ_max_scale + (threadIdx.x == 0 ? expf(sink - KQ_max[j]) : 0.0f);
++            KQ_sum[j] = KQ_sum[j]*KQ_max_scale + (threadIdx.x == 0 ? FATTN_EXPF(sink - KQ_max[j]) : 0.0f);
+ 
+ #ifdef V_DOT2_F32_F16_AVAILABLE
+             const half2 KQ_max_scale_h2 = make_half2(KQ_max_scale, KQ_max_scale);
+@@ -428,7 +436,7 @@ static __global__ void flash_attn_ext_vec(
+ 
+         float kqmax_new = KQ_max_shared[j_VKQ][threadIdx.x];
+         kqmax_new = warp_reduce_max(kqmax_new);
+-        const float kqmax_scale = expf(KQ_max[j_VKQ] - kqmax_new);
++        const float kqmax_scale = FATTN_EXPF(KQ_max[j_VKQ] - kqmax_new);
+         KQ_max[j_VKQ] = kqmax_new;
+ 
+ #ifdef V_DOT2_F32_F16_AVAILABLE
+diff --git a/ggml/src/ggml-cuda/fattn.cu b/ggml/src/ggml-cuda/fattn.cu
+index a25a890d..0113c47f 100644
+--- a/ggml/src/ggml-cuda/fattn.cu
++++ b/ggml/src/ggml-cuda/fattn.cu
+@@ -383,6 +383,13 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
+     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
+     const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && K->ne[1] % FATTN_KQ_STRIDE == 0;
  
 +#ifdef GGML_DETERMINISTIC
-+            const float KQ_max_scale = expf_det(kqmax[j] - kqmax_new_j);
-+#else
-             const float KQ_max_scale = expf(kqmax[j] - kqmax_new_j);
++    // Force vector kernel for deterministic mode — only fattn-vec has expf_det
++    if (can_use_vector_kernel) {
++        return BEST_FATTN_KERNEL_VEC;
++    }
 +#endif
-             kqmax[j] = kqmax_new_j;
- 
++
+     // If Turing tensor cores are available, use them:
+     if (turing_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
+         if (can_use_vector_kernel) {
+diff --git a/ggml/src/ggml-cuda/gated_delta_net.cu b/ggml/src/ggml-cuda/gated_delta_net.cu
+index 6b44bec7..47f401d1 100644
+--- a/ggml/src/ggml-cuda/gated_delta_net.cu
++++ b/ggml/src/ggml-cuda/gated_delta_net.cu
+@@ -1,4 +1,11 @@
+ #include "gated_delta_net.cuh"
++#include "ggml-deterministic.h"
++
 +#ifdef GGML_DETERMINISTIC
-+            const float val = expf_det(KQ[j*D + tid] - kqmax[j]);
++#define GDN_EXPF expf_det
 +#else
-             const float val = expf(KQ[j*D + tid] - kqmax[j]);
++#define GDN_EXPF expf
 +#endif
-             kqsum[j] = kqsum[j]*KQ_max_scale + val;
-             KQ[j*D + tid] = val;
  
-@@ -297,10 +306,18 @@ static __global__ void flash_attn_vec_ext_f32(
-             float kqmax_new_j = kqmax_shared[j][threadIdx.x];
-             kqmax_new_j = warp_reduce_max(kqmax_new_j);
+ template <int S_v, bool KDA>
+ __global__ void __launch_bounds__((ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v) * 4, 2)
+@@ -76,7 +83,7 @@ gated_delta_net_cuda(const float * q,
+         }
  
-+#ifdef GGML_DETERMINISTIC
-+            const float KQ_max_scale = expf_det(kqmax[j] - kqmax_new_j);
-+#else
-             const float KQ_max_scale = expf(kqmax[j] - kqmax_new_j);
-+#endif
-             kqmax[j] = kqmax_new_j;
+         if constexpr (!KDA) {
+-            const float g_val = expf(*g_t);
++            const float g_val = GDN_EXPF(*g_t);
  
-+#ifdef GGML_DETERMINISTIC
-+            const float val = expf_det(sink - kqmax[j]);
-+#else
-             const float val = expf(sink - kqmax[j]);
-+#endif
-             kqsum[j] = kqsum[j]*KQ_max_scale;
+             // kv[col] = (S^T @ k)[col] = sum_i S[i][col] * k[i]
+             float kv_shard = 0.0f;
+@@ -109,7 +116,7 @@ gated_delta_net_cuda(const float * q,
+ #pragma unroll
+             for (int r = 0; r < rows_per_lane; r++) {
+                 const int i = r * warp_size + lane;
+-                kv_shard += expf(g_t[i]) * s_shard[r] * k_reg[r];
++                kv_shard += GDN_EXPF(g_t[i]) * s_shard[r] * k_reg[r];
+             }
  
-             if (tid == 0) {
+             float kv_col = warp_reduce_sum<warp_size>(kv_shard);
+@@ -123,7 +130,7 @@ gated_delta_net_cuda(const float * q,
+ #pragma unroll
+             for (int r = 0; r < rows_per_lane; r++) {
+                 const int i = r * warp_size + lane;
+-                s_shard[r]  = expf(g_t[i]) * s_shard[r] + k_reg[r] * delta_col;
++                s_shard[r]  = GDN_EXPF(g_t[i]) * s_shard[r] + k_reg[r] * delta_col;
+                 attn_partial += s_shard[r] * q_reg[r];
+             }
+ 
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index f7b24fa6..22bae547 100644
+index d1239b1c..25d4ce0f 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -2010,9 +2010,11 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
+@@ -2194,7 +2194,7 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
+         return false;
+     }
+ 
+-    if (tensor->op == GGML_OP_MUL_MAT_ID && dst->ne[2] != 1) {
++    if (tensor->op == GGML_OP_MUL_MAT_ID && (dst->ne[2] != 1 || ggml_is_deterministic())) {
+         return false;
+     }
+ 
+@@ -2224,7 +2224,7 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
+         return false;
+     }
+ 
+-    if (tensor->op == GGML_OP_MUL_MAT_ID && dst->ne[2] != 1) {
++    if (tensor->op == GGML_OP_MUL_MAT_ID && (dst->ne[2] != 1 || ggml_is_deterministic())) {
+         return false;
+     }
+ 
+@@ -2253,9 +2253,10 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
          && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
      bool use_mul_mat_f     = !ggml_is_quantized(src0->type)
          && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
 +    // In deterministic mode, always use mmvq (never mmq) — our CPU code emulates mmvq.
-+    // mmvq processes one column at a time via the per-column loop in mmvq.cu.
      bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !bad_padding_clear
          && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
 -        && src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
@@ -1115,62 +2147,123 @@ index f7b24fa6..22bae547 100644
      bool use_mul_mat_q     = ggml_is_quantized(src0->type) && !bad_padding_clear
          && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
  
-@@ -2127,9 +2129,9 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
-     // same principle as attention/matmul: keep the reduction order and dtype
-     // stable, trading some throughput for reproducibility.
-     if (ggml_is_deterministic() && (src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16 || src1->type == GGML_TYPE_BF16) && dst->type == GGML_TYPE_F32) {
--        // ids is on device; copy to host once
-+        // ids is on device; copy raw bytes to host (preserving strides)
-         cudaStream_t stream = ctx.stream();
--        std::vector<int32_t> ids_h(ids->ne[0]*ids->ne[1]);
+@@ -2300,9 +2301,30 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
+     bool use_batched_cublas_bf16 = src0->type == GGML_TYPE_BF16 && bf16_mma_hardware_available(cc);
+     bool use_batched_cublas_f32  = src0->type == GGML_TYPE_F32;
+ 
+-    if (!split && use_mul_mat_vec_f) {
+-        // the custom F16 vector kernel can be used over batched cuBLAS GEMM
+-        // but this is only faster for GPUs without tensor cores or with a thin src0 matrix (particularly KQV in attention)
++    if (!split && ggml_is_deterministic() && (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16)
++            && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
++        // Deterministic: force F32/F16/BF16 through the vec kernel (not cuBLAS) for CPU-GPU parity
++        // Serialize large batches into single-column calls
++        if (src1->ne[1] <= MMVF_MAX_BATCH_SIZE) {
++            ggml_cuda_mul_mat_vec_f(ctx, src0, src1, nullptr, dst);
++        } else {
++            const int64_t ne11 = src1->ne[1];
++            const size_t ts1 = ggml_type_size(src1->type);
++            const size_t ts_dst = ggml_type_size(dst->type);
++            for (int64_t col = 0; col < ne11; col++) {
++                // Create temporary views for single column
++                ggml_tensor src1_col = *src1;
++                src1_col.ne[1] = 1;
++                src1_col.data = (char *)src1->data + col * src1->nb[1];
++
++                ggml_tensor dst_col = *dst;
++                dst_col.ne[1] = 1;
++                dst_col.data = (char *)dst->data + col * dst->nb[1];
++
++                ggml_cuda_mul_mat_vec_f(ctx, src0, &src1_col, nullptr, &dst_col);
++            }
++        }
++    } else if (!split && use_mul_mat_vec_f) {
+         ggml_cuda_mul_mat_vec_f(ctx, src0, src1, nullptr, dst);
+     } else if (!split && use_mul_mat_f) {
+         ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
+@@ -2338,6 +2360,60 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
+ 
+     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+ 
++    // Deterministic MoE: per-token-per-expert sequential matmul for CPU-GPU parity
++    if (ggml_is_deterministic() && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
++        cudaStream_t stream = ctx.stream();
 +        std::vector<char> ids_h(ggml_nbytes(ids));
-         CUDA_CHECK(cudaMemcpyAsync(ids_h.data(), ids->data, ggml_nbytes(ids), cudaMemcpyDeviceToHost, stream));
-         CUDA_CHECK(cudaStreamSynchronize(stream));
- 
-@@ -2147,7 +2149,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
- 
-         for (int64_t t = 0; t < ne12; ++t) {             // tokens
-             for (int64_t e = 0; e < ids->ne[0]; ++e) {    // expert slot
--                const int32_t ex = ids_h[t*ids->ne[0] + e];
++        CUDA_CHECK(cudaMemcpyAsync(ids_h.data(), ids->data, ggml_nbytes(ids), cudaMemcpyDeviceToHost, stream));
++        CUDA_CHECK(cudaStreamSynchronize(stream));
++
++        for (int64_t t = 0; t < ne12; ++t) {
++            for (int64_t e = 0; e < ids->ne[0]; ++e) {
 +                const int32_t ex = *(const int32_t *)(ids_h.data() + t*ids->nb[1] + e*ids->nb[0]);
-                 GGML_ASSERT(ex >= 0 && ex < ne02);
- 
-                 // Slice expert matrix: src0_slice = as[:,:,ex]
-@@ -2770,8 +2772,8 @@ static bool check_node_graph_compatibility_and_refresh_copy_ops(ggml_backend_cud
- #endif
-         }
- 
--        if (node->op == GGML_OP_MUL_MAT_ID && node->ne[2] != 1) {
--            use_cuda_graph = false; // This node type is not supported by CUDA graph capture
-+        if (node->op == GGML_OP_MUL_MAT_ID && (node->ne[2] != 1 || ggml_is_deterministic())) {
-+            use_cuda_graph = false; // MoE not supported by CUDA graph capture (det mode uses cudaMemcpy+sync)
- #ifndef NDEBUG
-             GGML_LOG_DEBUG("%s: disabling CUDA graphs due to unsupported node type\n", __func__);
- #endif
++                GGML_ASSERT(ex >= 0 && ex < ne02);
++
++                ggml_tensor src0_slice = *src0;
++                src0_slice.ne[2]    = 1;
++                src0_slice.nb[3]    = src0_slice.nb[2];
++                src0_slice.op       = GGML_OP_VIEW;
++                src0_slice.view_src = dst->src[0];
++                src0_slice.data     = (char *) src0->data + ex*nb02;
++
++                ggml_tensor src1_slice;
++                memset(&src1_slice, 0, sizeof(src1_slice));
++                src1_slice.buffer = src1->buffer;
++                src1_slice.type   = GGML_TYPE_F32;
++                src1_slice.ne[0]  = ne10;
++                src1_slice.ne[1]  = 1;
++                src1_slice.ne[2]  = 1;
++                src1_slice.ne[3]  = 1;
++                src1_slice.nb[0]  = sizeof(float);
++                src1_slice.nb[1]  = src1_slice.ne[0] * src1_slice.nb[0];
++                src1_slice.nb[2]  = src1_slice.ne[1] * src1_slice.nb[1];
++                src1_slice.nb[3]  = src1_slice.ne[2] * src1_slice.nb[2];
++                const int64_t src1_col = (ne11 > 1) ? e : 0;
++                src1_slice.data = (char *) src1->data + t*nb12 + src1_col*nb11;
++
++                ggml_tensor dst_slice;
++                memset(&dst_slice, 0, sizeof(dst_slice));
++                dst_slice.buffer = dst->buffer;
++                dst_slice.type   = GGML_TYPE_F32;
++                dst_slice.ne[0]  = ne0;
++                dst_slice.ne[1]  = 1;
++                dst_slice.ne[2]  = 1;
++                dst_slice.ne[3]  = 1;
++                dst_slice.nb[0]  = sizeof(float);
++                dst_slice.nb[1]  = dst_slice.ne[0] * dst_slice.nb[0];
++                dst_slice.nb[2]  = dst_slice.ne[1] * dst_slice.nb[1];
++                dst_slice.nb[3]  = dst_slice.ne[2] * dst_slice.nb[2];
++                dst_slice.data   = (char *) dst->data + t*nb2 + e*nb1;
++
++                ggml_cuda_mul_mat(ctx, &src0_slice, &src1_slice, &dst_slice);
++            }
++        }
++        return;
++    }
++
+     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
+     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+         static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index 52de4e78..6ab48ed5 100644
+index 8d80d1dd..a473dbad 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
-@@ -246,6 +246,27 @@ static void mul_mat_vec_q_switch_ncols_dst(
-         cudaStream_t stream) {
+@@ -721,6 +721,25 @@ static void mul_mat_vec_q_switch_ncols_dst(
+         const int ids_stride, cudaStream_t stream) {
  
      GGML_ASSERT(ncols_x % ggml_blck_size(type) == 0);
 +
 +#ifdef GGML_DETERMINISTIC
-+    // Process one column at a time to ensure consistent SASS across all batch sizes.
-+    // The ncols_dst=N kernel template generates different ptxas SASS per N.
 +    if (ncols_dst > 1) {
 +        for (int col = 0; col < ncols_dst; col++) {
 +            const void * vy_col = (const char *)vy + col * stride_col_y * sizeof(block_q8_1);
 +            float * dst_col = dst + col * stride_col_dst;
 +            mul_mat_vec_q_switch_ncols_dst<type>(
-+                vx, vy_col, ids, dst_col,
++                vx, vy_col, ids, fusion, dst_col,
 +                ncols_x, nrows_x, 1,
 +                stride_row_x, stride_col_y, stride_col_dst,
 +                nchannels_x, nchannels_y, nchannels_dst,
 +                stride_channel_x, stride_channel_y, stride_channel_dst,
 +                nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst,
-+                stream);
++                ids_stride, stream);
 +        }
 +        return;
 +    }
@@ -1180,32 +2273,52 @@ index 52de4e78..6ab48ed5 100644
  
      const uint3 nchannels_y_fd   = ids ? init_fastdiv_values(nchannels_y) : make_uint3(0, 0, 0);
 diff --git a/ggml/src/ggml-cuda/norm.cu b/ggml/src/ggml-cuda/norm.cu
-index 4f153c57..88ef2360 100644
+index ef98f675..74cfe4d3 100644
 --- a/ggml/src/ggml-cuda/norm.cu
 +++ b/ggml/src/ggml-cuda/norm.cu
-@@ -181,7 +181,11 @@ static __global__ void rms_norm_f32(const float * x,
-     }
+@@ -134,7 +134,11 @@ static __global__ void rms_norm_f32(const float * x,
+     tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
  
      const float mean = tmp / ncols;
 +#ifdef GGML_DETERMINISTIC
-+    const float scale = __frsqrt_rn(mean + eps); // correctly-rounded, matches CPU
++    const float scale = __frsqrt_rn(mean + eps);
 +#else
      const float scale = rsqrtf(mean + eps);
 +#endif
  
      for (int col = tid; col < ncols; col += block_size) {
          if constexpr (do_multiply && do_add) {
+@@ -263,7 +267,11 @@ static __global__ void l2_norm_f32(
+     tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+ 
+     // from https://pytorch.org/docs/stable/generated/torch.nn.functional.normalize.html
++#ifdef GGML_DETERMINISTIC
++    const float scale = __frsqrt_rn(fmaxf(tmp, eps * eps));
++#else
+     const float scale = rsqrtf(fmaxf(tmp, eps * eps));
++#endif
+ 
+     for (int col = tid; col < ncols; col += block_size) {
+         dst[col] = scale * x[col];
 diff --git a/ggml/src/ggml-cuda/rope.cu b/ggml/src/ggml-cuda/rope.cu
-index d058504c..7c3859a2 100644
+index 45a49a5d..25c5f0a8 100644
 --- a/ggml/src/ggml-cuda/rope.cu
 +++ b/ggml/src/ggml-cuda/rope.cu
-@@ -1,4 +1,5 @@
+@@ -2,6 +2,13 @@
+ #include "ggml-cuda/common.cuh"
+ #include "ggml.h"
  #include "rope.cuh"
 +#include "ggml-deterministic.h"
++
++#ifdef GGML_DETERMINISTIC
++#define ROPE_POWF(base, exp) powf_int_det(base, (int)(exp))
++#else
++#define ROPE_POWF(base, exp) powf(base, exp)
++#endif
  
  struct rope_corr_dims {
      float v[2];
-@@ -30,8 +31,14 @@ static __device__ void rope_yarn(
+@@ -33,8 +40,14 @@ static __device__ void rope_yarn(
          // Get n-d magnitude scaling corrected for interpolation
          mscale *= 1.0f + 0.1f * logf(1.0f / freq_scale);
      }
@@ -1220,44 +2333,351 @@ index d058504c..7c3859a2 100644
      if (!forward) {
          sin_theta *= -1.0f;
      }
-@@ -63,7 +70,11 @@ static __global__ void rope_norm(
+@@ -97,7 +110,7 @@ static __global__ void rope_norm(const T *            x,
          return;
      }
  
-+#ifdef GGML_DETERMINISTIC
-+    const float theta_base = pos[channel_x]*powf_int_det(theta_scale, i0/2);
-+#else
-     const float theta_base = pos[channel_x]*powf(theta_scale, i0/2.0f);
-+#endif
+-    const float theta_base = pos[i2]*powf(theta_scale, i0/2.0f);
++    const float theta_base = pos[i2]*ROPE_POWF(theta_scale, i0/2.0f);
  
      const float freq_factor = has_ff ? freq_factors[i0/2] : 1.0f;
  
-@@ -105,7 +116,11 @@ static __global__ void rope_neox(
+@@ -163,7 +176,7 @@ static __global__ void rope_neox(const T *            x,
          return;
      }
  
-+#ifdef GGML_DETERMINISTIC
-+    const float theta_base = pos[channel_x]*powf_int_det(theta_scale, i0/2);
-+#else
-     const float theta_base = pos[channel_x]*powf(theta_scale, i0/2.0f);
-+#endif
+-    const float theta_base = pos[i2]*powf(theta_scale, i0/2.0f);
++    const float theta_base = pos[i2]*ROPE_POWF(theta_scale, i0/2.0f);
  
      const float freq_factor = has_ff ? freq_factors[i0/2] : 1.0f;
  
-diff --git a/ggml/src/ggml-cuda/unary.cu b/ggml/src/ggml-cuda/unary.cu
-index 5aff8a87..acc42b09 100644
---- a/ggml/src/ggml-cuda/unary.cu
-+++ b/ggml/src/ggml-cuda/unary.cu
-@@ -1,4 +1,5 @@
- #include "unary.cuh"
+@@ -230,23 +243,23 @@ static __global__ void rope_multi(const T *            x,
+     float theta_base = 0.0;
+     if (is_imrope) {
+         if (sector % 3 == 1 && sector < 3 * sections.v[1]) {         // h
+-            theta_base = pos[i2 + ne02 * 1] * powf(theta_scale, i0 / 2.0f);
++            theta_base = pos[i2 + ne02 * 1] * ROPE_POWF(theta_scale, i0 / 2.0f);
+         } else if (sector % 3 == 2 && sector < 3 * sections.v[2]) {  // w
+-            theta_base = pos[i2 + ne02 * 2] * powf(theta_scale, i0 / 2.0f);
++            theta_base = pos[i2 + ne02 * 2] * ROPE_POWF(theta_scale, i0 / 2.0f);
+         } else if (sector % 3 == 0 && sector < 3 * sections.v[0]) {  // t
+-            theta_base = pos[i2] * powf(theta_scale, i0 / 2.0f);
++            theta_base = pos[i2] * ROPE_POWF(theta_scale, i0 / 2.0f);
+         } else {
+-            theta_base = pos[i2 + ne02 * 3] * powf(theta_scale, i0 / 2.0f);
++            theta_base = pos[i2 + ne02 * 3] * ROPE_POWF(theta_scale, i0 / 2.0f);
+         }
+     } else {
+         if (sector < sections.v[0]) {
+-            theta_base = pos[i2] * powf(theta_scale, i0 / 2.0f);
++            theta_base = pos[i2] * ROPE_POWF(theta_scale, i0 / 2.0f);
+         } else if (sector >= sections.v[0] && sector < sec_w) {
+-            theta_base = pos[i2 + ne02 * 1] * powf(theta_scale, i0 / 2.0f);
++            theta_base = pos[i2 + ne02 * 1] * ROPE_POWF(theta_scale, i0 / 2.0f);
+         } else if (sector >= sec_w && sector < sec_w + sections.v[2]) {
+-            theta_base = pos[i2 + ne02 * 2] * powf(theta_scale, i0 / 2.0f);
++            theta_base = pos[i2 + ne02 * 2] * ROPE_POWF(theta_scale, i0 / 2.0f);
+         } else if (sector >= sec_w + sections.v[2]) {
+-            theta_base = pos[i2 + ne02 * 3] * powf(theta_scale, i0 / 2.0f);
++            theta_base = pos[i2 + ne02 * 3] * ROPE_POWF(theta_scale, i0 / 2.0f);
+         }
+     }
+ 
+@@ -307,10 +320,10 @@ static __global__ void rope_vision(const T *            x,
+     float theta_base = 0.0;
+     if (sector < sections.v[0]) {
+         const int p = sector;
+-        theta_base  = pos[i2] * powf(theta_scale, p);
++        theta_base  = pos[i2] * ROPE_POWF(theta_scale, p);
+     } else if (sector >= sections.v[0] && sector < sec_w) {
+         const int p = sector - sections.v[0];
+-        theta_base  = pos[i2 + ne02] * powf(theta_scale, p);
++        theta_base  = pos[i2 + ne02] * ROPE_POWF(theta_scale, p);
+     }
+ 
+     const float freq_factor = has_ff ? freq_factors[i0/2] : 1.0f;
+diff --git a/ggml/src/ggml-cuda/softmax.cu b/ggml/src/ggml-cuda/softmax.cu
+index 285c0e95..2def9b27 100644
+--- a/ggml/src/ggml-cuda/softmax.cu
++++ b/ggml/src/ggml-cuda/softmax.cu
+@@ -1,6 +1,7 @@
+ #include "common.cuh"
+ #include "ggml.h"
+ #include "softmax.cuh"
 +#include "ggml-deterministic.h"
  
- static __device__ __forceinline__ float op_abs(float x) {
-     return fabsf(x);
-@@ -36,7 +37,11 @@ static __device__ __forceinline__ float op_gelu_quick(float x) {
+ #ifdef GGML_USE_HIP
+ #include <hip/hip_cooperative_groups.h>
+@@ -111,7 +112,11 @@ static __global__ void soft_max_f32(
+             break;
+         }
+ 
++#ifdef GGML_DETERMINISTIC
++        const float val = expf_det(vals[col] - max_val);
++#else
+         const float val = expf(vals[col] - max_val);
++#endif
+         tmp += val;
+         vals[col] = val;
+     }
+@@ -120,7 +125,11 @@ static __global__ void soft_max_f32(
+     tmp = block_reduce<block_reduce_method::SUM, block_size_template>(tmp, buf_iw);
+ 
+     if (sinks) {
++#ifdef GGML_DETERMINISTIC
++        tmp += expf_det(sinks[i02] - max_val);
++#else
+         tmp += expf(sinks[i02] - max_val);
++#endif
+     }
+ 
+     const float inv_sum = 1.0f / tmp;
+@@ -200,7 +209,11 @@ static __device__ void soft_max_f32_parallelize_cols_single_row(const float * __
+         for (int i = 0; i < n_elem_per_thread; i++) {
+             const int idx = col + i * step_size;
+             if (idx < p.ncols) {
++#ifdef GGML_DETERMINISTIC
++                const float tmp = expf_det(local_vals[i] - local_max);
++#else
+                 const float tmp = expf(local_vals[i] - local_max);
++#endif
+                 tmp_expf += tmp;
+                 dst[idx] = tmp;
+             }
+diff --git a/ggml/src/ggml-cuda/solve_tri.cu b/ggml/src/ggml-cuda/solve_tri.cu
+index 07ca33f5..e38faa4b 100644
+--- a/ggml/src/ggml-cuda/solve_tri.cu
++++ b/ggml/src/ggml-cuda/solve_tri.cu
+@@ -2,6 +2,38 @@
+ #include "ggml.h"
+ #include "solve_tri.cuh"
+ 
++#ifdef GGML_DETERMINISTIC
++// Simple per-column sequential forward substitution for deterministic mode.
++// One thread per column, sequential row processing — matches CPU exactly.
++static __global__ void solve_tri_f32_det(const float * __restrict__ A,
++                                         const float * __restrict__ B,
++                                         float * __restrict__ X,
++                                         int64_t ne02, int64_t ne03,
++                                         size_t nb02, size_t nb03,
++                                         size_t nb12, size_t nb13,
++                                         size_t nb2, size_t nb3,
++                                         int n, int k) {
++    const int col = blockIdx.x * blockDim.x + threadIdx.x;
++    const int batch = blockIdx.y;
++    if (col >= k) return;
++
++    const int64_t i03 = batch / ne02;
++    const int64_t i02 = batch % ne02;
++
++    const float * A_batch = A + i02 * nb02 + i03 * nb03;
++    const float * B_batch = B + i02 * nb12 + i03 * nb13;
++    float * X_batch = X + i02 * nb2 + i03 * nb3;
++
++    for (int row = 0; row < n; row++) {
++        float sum = 0.0f;
++        for (int t = 0; t < row; t++) {
++            sum += A_batch[row * n + t] * X_batch[t * k + col];
++        }
++        X_batch[row * k + col] = (B_batch[row * k + col] - sum) / A_batch[row * n + row];
++    }
++}
++#endif
++
+ #define MAX_N_FAST 64
+ #define MAX_K_FAST 32
+ 
+@@ -261,6 +293,19 @@ void ggml_cuda_op_solve_tri(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
+     const int64_t ne02 = src0->ne[2];
+     const int64_t ne03 = src0->ne[3];
+ 
++#ifdef GGML_DETERMINISTIC
++    // Simple sequential kernel matching CPU for bitwise parity
++    const int64_t total_batches = ne02 * ne03;
++    dim3 block(256);
++    dim3 grid((k + 255) / 256, total_batches);
++    solve_tri_f32_det<<<grid, block, 0, ctx.stream()>>>(
++        (const float *) src0->data, (const float *) src1->data, (float *) dst->data,
++        ne02, ne03,
++        src0->nb[2] / sizeof(float), src0->nb[3] / sizeof(float),
++        src1->nb[2] / sizeof(float), src1->nb[3] / sizeof(float),
++        dst->nb[2] / sizeof(float), dst->nb[3] / sizeof(float),
++        n, k);
++#else
+     if (n <= MAX_N_FAST && k <= MAX_K_FAST) {
+         solve_tri_f32_cuda((const float *) src0->data, (const float *) src1->data, (float *) dst->data, n, k,
+                            src0->ne[2], src0->ne[3], src0->nb[2] / sizeof(float), src0->nb[3] / sizeof(float),
+@@ -272,4 +317,5 @@ void ggml_cuda_op_solve_tri(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
+                              src1->nb[2] / sizeof(float), src1->nb[3] / sizeof(float), dst->nb[2] / sizeof(float),
+                              dst->nb[3] / sizeof(float), ctx.stream());
+     }
++#endif
+ }
+diff --git a/ggml/src/ggml-cuda/ssm-scan.cu b/ggml/src/ggml-cuda/ssm-scan.cu
+index c1d4e2bc..7958a8f9 100644
+--- a/ggml/src/ggml-cuda/ssm-scan.cu
++++ b/ggml/src/ggml-cuda/ssm-scan.cu
+@@ -8,6 +8,15 @@ using namespace cub;
+ #endif // USE_CUB
+ 
+ #include "ssm-scan.cuh"
++#include "ggml-deterministic.h"
++
++#ifdef GGML_DETERMINISTIC
++#define SSM_EXPF expf_det
++#define SSM_SOFTPLUS(x) softplus_det(x)
++#else
++#define SSM_EXPF expf
++#define SSM_SOFTPLUS(x) ((x) <= 20.0f ? log1pf(expf(x)) : (x))
++#endif
+ 
+ // We would like to keep pragma unroll for cases where L_template is not 0,
+ // so we suppress the clang transformation warning.
+@@ -81,17 +90,14 @@ __global__ void __launch_bounds__(splitD, 1)
+         __syncthreads();
+ 
+         float dt_soft_plus = dt_block[i * stride_dt + threadIdx.x];
+-        if (dt_soft_plus <= 20.0f)
+-        {
+-            dt_soft_plus = log1pf(expf(dt_soft_plus));
+-        }
++        dt_soft_plus = SSM_SOFTPLUS(dt_soft_plus);
+         float x_dt = x_block[i * stride_x + threadIdx.x] * dt_soft_plus;
+ 
+         float sumf = 0.0f;
+ #pragma unroll
+         for (size_t n = 0; n < N; n++)
+         {
+-            float state = regs0[n] * expf(dt_soft_plus * regA[n]) + smemB[n] * x_dt;
++            float state = regs0[n] * SSM_EXPF(dt_soft_plus * regA[n]) + smemB[n] * x_dt;
+             sumf += state * smemC[n];
+             regs0[n] = state;
+         }
+@@ -163,10 +169,10 @@ __global__ void __launch_bounds__(d_state, 1)
+     for (int64_t i = 0; i < n_tok; i++) {
+         // NOTE: dt_soft_plus, dA and x_dt have the same value for a warp here.
+         // Recalculation is intentional; sharing via shuffles/smem proved slower due to sync overhead.
+-        const float dt_soft_plus = (dt_warp[i * stride_dt] <= 20.0f ? log1pf(expf(dt_warp[i * stride_dt])) : dt_warp[i * stride_dt]);
++        const float dt_soft_plus = SSM_SOFTPLUS(dt_warp[i * stride_dt]);
+ 
+         state_sum = 0.0f;
+-        const float dA   = expf(dt_soft_plus * A_warp[0]);
++        const float dA   = SSM_EXPF(dt_soft_plus * A_warp[0]);
+         const float x_dt = x_warp[i * stride_x] * dt_soft_plus;
+ #pragma unroll
+         for (int j = 0; j < c_factor; j++) {
+diff --git a/ggml/src/ggml-cuda/sumrows.cu b/ggml/src/ggml-cuda/sumrows.cu
+index 4025771a..de3ab4ec 100644
+--- a/ggml/src/ggml-cuda/sumrows.cu
++++ b/ggml/src/ggml-cuda/sumrows.cu
+@@ -1,6 +1,19 @@
+ #include "reduce_rows.cuh"
+ #include "sumrows.cuh"
+ 
++#ifdef GGML_DETERMINISTIC
++// Simple deterministic sum_rows: one thread per row, sequential sum.
++// Matches CPU's sequential ggml_vec_sum_f32 exactly.
++static __global__ void sum_rows_f32_det(const float * __restrict__ x, float * __restrict__ dst, const int ncols) {
++    const int row = blockIdx.x * blockDim.x + threadIdx.x;
++    float sum = 0.0f;
++    for (int i = 0; i < ncols; i++) {
++        sum += x[row * ncols + i];
++    }
++    dst[row] = sum;
++}
++#endif
++
+ void sum_rows_f32_cuda(const float * x, float * dst, const int ncols, const int nrows, cudaStream_t stream) {
+     const int  id  = ggml_cuda_get_device();
+     const int  nsm = ggml_cuda_info().devices[id].nsm;
+@@ -27,17 +40,22 @@ void ggml_cuda_op_sum_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     const int64_t ncols = src0->ne[0];
+     const int64_t nrows = ggml_nrows(src0);
+ 
++#ifdef GGML_DETERMINISTIC
++    // Simple sequential sum per row — matches CPU exactly
++    const dim3 block(256);
++    const dim3 grid((nrows + 255) / 256);
++    sum_rows_f32_det<<<grid, block, 0, stream>>>(src0_d, dst_d, ncols);
++#else
+     const dim3 block_nums(nrows, 1, 1);
+ 
+     const int id  = ggml_cuda_get_device();
+     const int nsm = ggml_cuda_info().devices[id].nsm;
+     if ((nrows / nsm) < 2) {
+-        // Increase num threads to 512 for small nrows to better hide the latency
+         const dim3 block_dims(512, 1, 1);
+         reduce_rows_f32</*norm=*/false><<<block_nums, block_dims, 0, stream>>>(src0_d, dst_d, ncols);
+     } else {
+-        // Enough active SMs to hide latency, use smaller blocks to allow better scheduling
+         const dim3 block_dims(ncols < 1024 ? 32 : 128, 1, 1);
+         reduce_rows_f32</*norm=*/false><<<block_nums, block_dims, 0, stream>>>(src0_d, dst_d, ncols);
+     }
++#endif
+ }
+diff --git a/ggml/src/ggml-cuda/unary.cu b/ggml/src/ggml-cuda/unary.cu
+index 4ad30fa1..f55b04f0 100644
+--- a/ggml/src/ggml-cuda/unary.cu
++++ b/ggml/src/ggml-cuda/unary.cu
+@@ -46,7 +46,11 @@ static __device__ __forceinline__ float op_relu(float x) {
  }
  
- static __device__ __forceinline__ float op_silu(float x) {
+ static __device__ __forceinline__ float op_sigmoid(float x) {
++#ifdef GGML_DETERMINISTIC
++    return 1.0f / (1.0f + expf_det(-x));
++#else
+     return 1.0f / (1.0f + expf(-x));
++#endif
+ }
+ 
+ static __device__ __forceinline__ float op_hardsigmoid(float x) {
+@@ -58,7 +62,11 @@ static __device__ __forceinline__ float op_hardswish(float x) {
+ }
+ 
+ static __device__ __forceinline__ float op_exp(float x) {
++#ifdef GGML_DETERMINISTIC
++    return expf_det(x);
++#else
+     return expf(x);
++#endif
+ }
+ 
+ static __device__ __forceinline__ float op_sqr(float x) {
+@@ -82,11 +90,19 @@ static __device__ __forceinline__ float op_log(float x) {
+ }
+ 
+ static __device__ __forceinline__ float op_expm1(float x) {
++#ifdef GGML_DETERMINISTIC
++    return expf_det(x) - 1.0f;
++#else
+     return expm1f(x);
++#endif
+ }
+ 
+ static __device__ __forceinline__ float op_softplus(float x) {
++#ifdef GGML_DETERMINISTIC
++    return softplus_det(x);
++#else
+     return (x > 20.0f) ? x : logf(1.0f + expf(x));
++#endif
+ }
+ 
+ static __device__ __forceinline__ float op_elu(float x) {
+diff --git a/ggml/src/ggml-cuda/unary.cuh b/ggml/src/ggml-cuda/unary.cuh
+index f1dd2183..d96315be 100644
+--- a/ggml/src/ggml-cuda/unary.cuh
++++ b/ggml/src/ggml-cuda/unary.cuh
+@@ -1,5 +1,6 @@
+ #pragma once
+ #include "common.cuh"
++#include "ggml-deterministic.h"
+ 
+ #define CUDA_NEG_BLOCK_SIZE 256
+ #define CUDA_STEP_BLOCK_SIZE 256
+@@ -92,7 +93,11 @@ void ggml_cuda_op_xielu(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+ void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary_node, ggml_tensor * mul_node);
+ 
+ __device__ __forceinline__ float ggml_cuda_op_silu_single(float x) {
 +#ifdef GGML_DETERMINISTIC
 +    return silu_det(x);
 +#else
@@ -1265,18 +2685,16 @@ index 5aff8a87..acc42b09 100644
 +#endif
  }
  
- static __device__ __forceinline__ float op_tanh(float x) {
+ __device__ __forceinline__ float ggml_cuda_op_gelu_single(float x) {
 diff --git a/ggml/src/ggml-cuda/vecdotq.cuh b/ggml/src/ggml-cuda/vecdotq.cuh
-index 6baab117..16daabc3 100644
+index 40b2b41e..3ebe5fea 100644
 --- a/ggml/src/ggml-cuda/vecdotq.cuh
 +++ b/ggml/src/ggml-cuda/vecdotq.cuh
-@@ -479,7 +479,14 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1_impl_vmmq(
+@@ -520,7 +520,12 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1_impl_vmmq(
  
      const float2 dm4f = __half22float2(dm4);
  
 +#ifdef GGML_DETERMINISTIC
-+    // Force specific rounding: mul(dm4f_y, sumf_m), then fma(dm4f_x, sumf_d, -t), matching CPU fmaf pattern.
-+    // Without this, ptxas JIT may restructure FFMA chains differently in unrolled loops.
 +    const float t = __fmul_rn(dm4f.y, sumf_m);
 +    return __fmaf_rn(dm4f.x, sumf_d, -t);
 +#else
@@ -1285,12 +2703,25 @@ index 6baab117..16daabc3 100644
  }
  
  // contiguous v/x + u/y values
+@@ -583,7 +588,12 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1_impl_vmmq(
+ 
+     const float2 dm5f = __half22float2(dm5);
+ 
++#ifdef GGML_DETERMINISTIC
++    const float t = __fmul_rn(dm5f.y, sumf_m);
++    return __fmaf_rn(dm5f.x, sumf_d, -t);
++#else
+     return dm5f.x*sumf_d - dm5f.y*sumf_m;
++#endif
+ }
+ 
+ // contiguous v/x + u/y values
 diff --git a/ggml/src/ggml-deterministic.h b/ggml/src/ggml-deterministic.h
 new file mode 100644
-index 00000000..ba71eec8
+index 00000000..6587afbe
 --- /dev/null
 +++ b/ggml/src/ggml-deterministic.h
-@@ -0,0 +1,121 @@
+@@ -0,0 +1,162 @@
 +// Portable math functions for GPU-CPU deterministic parity.
 +// These use only FMA + basic IEEE ops, producing bitwise-identical
 +// results on both CUDA and x86 when compiled with FMA support.
@@ -1404,6 +2835,47 @@ index 00000000..ba71eec8
 +    *cp = c;
 +}
 +
++// Portable logf using Cody-Waite style reduction.
++// Uses the identity: log(x) = log(2) * (e + log2(m)) where x = m * 2^e, 1 <= m < 2
++// Then log2(m) ≈ polynomial on [1,2)
++static inline
++#ifdef __CUDA_ARCH__
++__device__
++#endif
++float logf_det(float x) {
++    // Decompose x = m * 2^e via bit manipulation
++    union { float f; uint32_t u; } conv;
++    conv.f = x;
++    int e = (int)((conv.u >> 23) & 0xFF) - 127;
++    conv.u = (conv.u & 0x007FFFFF) | 0x3F800000; // m in [1, 2)
++    float m = conv.f;
++
++    // Reduce to f = (m-1)/(m+1), then log(m) = 2*f*(1 + f²/3 + f⁴/5 + ...)
++    float f = (m - 1.0f) / (m + 1.0f);
++    float f2 = f * f;
++
++    // Minimax polynomial: log(m) ≈ 2*f * (1 + c1*f² + c2*f⁴ + c3*f⁶)
++    float p = DET_FMA(0.2424046874f, f2, 0.4005714059f);
++    p = DET_FMA(p, f2, 0.6666666269f);
++    p = DET_FMA(p, f2, 2.0f);
++    float log_m = f * p;
++
++    // log(x) = e * ln(2) + log(m)
++    const float ln2 = 0.6931471805599453f;
++    return DET_FMA((float)e, ln2, log_m);
++}
++
++// Portable softplus: log(1 + exp(x))
++static inline
++#ifdef __CUDA_ARCH__
++__device__
++#endif
++float softplus_det(float x) {
++    if (x > 20.0f) return x;
++    float ex = expf_det(x);
++    return logf_det(1.0f + ex);
++}
++
 +// Portable SiLU using expf_det
 +static inline
 +#ifdef __CUDA_ARCH__
@@ -1412,11 +2884,31 @@ index 00000000..ba71eec8
 +float silu_det(float x) {
 +    return x / (1.0f + expf_det(-x));
 +}
+diff --git a/ggml/src/ggml-impl.h b/ggml/src/ggml-impl.h
+index 0639db36..9ca4856c 100644
+--- a/ggml/src/ggml-impl.h
++++ b/ggml/src/ggml-impl.h
+@@ -103,6 +103,7 @@ static inline bool ggml_impl_is_view(const struct ggml_tensor * t) {
+ }
+ 
+ static inline float ggml_compute_softplus_f32(float input) {
++    // Note: for deterministic mode, callers should use softplus_det() from ggml-deterministic.h
+     return (input > 20.0f) ? input : logf(1 + expf(input));
+ }
+ //
 diff --git a/ggml/src/ggml-quants.c b/ggml/src/ggml-quants.c
-index 72793212..d49cd008 100644
+index 48695a61..442d4084 100644
 --- a/ggml/src/ggml-quants.c
 +++ b/ggml/src/ggml-quants.c
-@@ -236,21 +236,31 @@ void quantize_row_q8_1_ref(const float * GGML_RESTRICT x, block_q8_1 * GGML_REST
+@@ -5,6 +5,7 @@
+ #include "ggml-impl.h"
+ #include "ggml-cpu/ggml-cpu-impl.h"
+ #include "ggml-cpu.h"
++#include "ggml.h"
+ 
+ #include <math.h>
+ #include <string.h>
+@@ -236,21 +237,31 @@ void quantize_row_q8_1_ref(const float * GGML_RESTRICT x, block_q8_1 * GGML_REST
          }
  
          const float d = amax / ((1 << 7) - 1);
@@ -1456,338 +2948,229 @@ index 72793212..d49cd008 100644
          }
  
          y[i].s = GGML_FP32_TO_FP16(sum*d);
-diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
-index 29065239..5af0aa56 100644
---- a/src/llama-graph.cpp
-+++ b/src/llama-graph.cpp
-@@ -1287,7 +1287,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
-             // Enforce KV multiple-of-256 and mask padded to GGML_KQ_MASK_PAD
-             const int64_t n_kv_expect_stride = 256;
-             const int64_t n_kv_cur = k->ne[1];
--            if (n_kv_cur % n_kv_expect_stride != 0) {
-+            if (n_kv_cur % n_kv_expect_stride != 0 && n_kv_cur >= n_kv_expect_stride) {
-                 GGML_ABORT("deterministic attention: KV length (%lld) must be a multiple of 256; increase/pad context under determinism.", (long long) n_kv_cur);
-             }
-             if (kq_mask) {
-diff --git a/tests/test-expf-parity.cu b/tests/test-expf-parity.cu
-new file mode 100644
-index 00000000..09d5c188
---- /dev/null
-+++ b/tests/test-expf-parity.cu
-@@ -0,0 +1,54 @@
-+// Test expf parity between CUDA and glibc
-+// Compile: nvcc -o test-expf-parity test-expf-parity.cu -lm
-+// Run: ./test-expf-parity > gpu_expf.txt
-+// Then compare with CPU version
-+
-+#include <cstdio>
-+#include <cstdint>
-+#include <cstring>
-+#include <cmath>
-+
-+__global__ void compute_expf(const float *in, float *out, int n) {
-+    int i = blockDim.x * blockIdx.x + threadIdx.x;
-+    if (i < n) out[i] = expf(in[i]);
-+}
-+
-+int main() {
-+    // Test range: values relevant to SiLU(-x) where x is typical layer activation
-+    // Typical range: -20 to 20
-+    const int N = 10000;
-+    float h_in[N], h_out[N];
-+
-+    // Generate test values: -20 to 20 in steps, plus specific problematic values
-+    for (int i = 0; i < N; i++) {
-+        h_in[i] = -20.0f + 40.0f * i / (N - 1);
-+    }
-+
-+    float *d_in, *d_out;
-+    cudaMalloc(&d_in, N * sizeof(float));
-+    cudaMalloc(&d_out, N * sizeof(float));
-+    cudaMemcpy(d_in, h_in, N * sizeof(float), cudaMemcpyHostToDevice);
-+
-+    compute_expf<<<(N+255)/256, 256>>>(d_in, d_out, N);
-+    cudaMemcpy(h_out, d_out, N * sizeof(float), cudaMemcpyDeviceToHost);
-+
-+    // Also compute CPU expf and compare
-+    int mismatches = 0;
-+    for (int i = 0; i < N; i++) {
-+        float cpu_exp = expf(h_in[i]);
-+        uint32_t gpu_bits, cpu_bits;
-+        memcpy(&gpu_bits, &h_out[i], 4);
-+        memcpy(&cpu_bits, &cpu_exp, 4);
-+        if (gpu_bits != cpu_bits) {
-+            if (mismatches < 20) {
-+                printf("MISMATCH i=%d x=%.10e gpu_exp=%08x(%.10e) cpu_exp=%08x(%.10e) diff=%d\n",
-+                    i, h_in[i], gpu_bits, h_out[i], cpu_bits, cpu_exp, (int)gpu_bits - (int)cpu_bits);
-+            }
-+            mismatches++;
-+        }
-+    }
-+    printf("Total: %d / %d mismatches\n", mismatches, N);
-+
-+    cudaFree(d_in);
-+    cudaFree(d_out);
-+}
-diff --git a/tests/test-expf-ptx-match.cu b/tests/test-expf-ptx-match.cu
-new file mode 100644
-index 00000000..6df53ea0
---- /dev/null
-+++ b/tests/test-expf-ptx-match.cu
-@@ -0,0 +1,125 @@
-+// Replicate the exact PTX sequence of CUDA's expf on CPU
-+// Key: the hardware ex2.approx.ftz.f32 instruction
-+#include <cstdio>
-+#include <cstdint>
-+#include <cstring>
-+#include <cmath>
-+
-+// Exact replica of the PTX from nvcc's expf() compilation
-+// Works on CPU by using exp2f() for the ex2.approx step
-+static inline float expf_cuda_ptx(float x) {
-+    // PTX constants (from the disassembly)
-+    const float c1 = 0.5f;                    // 0f3F000000
-+    const float c2 = 5.7314485e-03f;          // 0f3BBB989D — actually let me decode properly
-+    const float c3 = 252.0f;                  // 0f437C0000
-+    const float c4 = 12582913.0f;             // 0f4B400001 — rounding magic
-+    const float c5 = -12582784.0f + 127.0f;   // 0fCB40007F = -12582784 + ... decode properly
-+    const float log2e_hi = 1.44269502163f;     // 0f3FB8AA3B
-+    const float log2e_lo = 1.92596299e-8f;     // 0f32A57060
-+
-+    // PTX sequence:
-+    // f4 = fma.rn(x, c2, c1)          -- f4 = x * 5.73e-3 + 0.5
-+    // f5 = cvt.sat(f4)                -- clamp to [0,1]
-+    // f8 = fma.rm(f5, c3, c4)         -- f8 = f5 * 252 + 12582913 (round-to-minus-inf)
-+    // f9 = f8 + c5                    -- f9 = f8 - 12582784 + 127... this extracts integer part
-+    // f10 = -f9                       -- negate
-+    // f12 = fma.rn(x, log2e_hi, f10)  -- f12 = x*log2e_hi - f9 (reduced argument)
-+    // f14 = fma.rn(x, log2e_lo, f12)  -- f14 = x*log2e_lo + f12 (Cody-Waite correction)
-+    // r1 = bitcast(f8)                -- integer bits of f8
-+    // r2 = r1 << 23                   -- shift to exponent position (2^n scaling)
-+    // f15 = bitcast(r2)               -- 2^n as float
-+    // f16 = ex2.approx.ftz(f14)       -- hardware 2^f14
-+    // f17 = f16 * f15                 -- result = 2^f14 * 2^n
-+
-+    // Replicate:
-+    float f4 = fmaf(x, 5.7314485e-03f, 0.5f);
-+    float f5 = fmaxf(0.0f, fminf(1.0f, f4)); // cvt.sat
-+
-+    // fma.rm (round toward minus infinity) — use floor-based approach
-+    // Actually fma.rm is FMA with round-to-negative-infinity mode
-+    // On CPU we can't easily control rounding mode per-instruction
-+    // Let's try: the purpose is to compute floor(f5 * 252 + 0.5) basically
-+    // Actually c4 = 12582913 = 2^23 * 1.5 + 1 — this is the "magic number" rounding trick
-+    // fma.rm(f5, 252, 12582913) with round-down gives the integer part embedded in float bits
-+
-+    // For now, let's try computing n = floor(x * log2e + 0.5) = round(x * log2e)
-+    // and r = x * log2e - n using Cody-Waite
-+
-+    // Actually, let me decode the PTX more carefully using hex constants
-+    uint32_t tmp;
-+
-+    // c2 = 0x3BBB989D
-+    tmp = 0x3BBB989D; float c2_exact; memcpy(&c2_exact, &tmp, 4);
-+
-+    // c5 = 0xCB40007F
-+    tmp = 0xCB40007F; float c5_exact; memcpy(&c5_exact, &tmp, 4);
-+
-+    f4 = fmaf(x, c2_exact, 0.5f);
-+    f5 = fmaxf(0.0f, fminf(1.0f, f4));
-+
-+    // fma.rm — round to minus infinity
-+    // We need to emulate this. fesetround(FE_DOWNWARD) is thread-unsafe.
-+    // Alternative: use the bit-trick directly
-+    // The magic number trick: adding 2^23*1.5 to a float in [0, 252] and reading the mantissa bits
-+    // gives the rounded integer value.
-+    // fma.rm(f5, 252, 12582913) with round-down:
-+    float f8_product = f5 * 252.0f + 12582913.0f;
-+    // With round-to-nearest, this might differ from round-to-minus-inf by 1
-+    // For now, approximate:
-+    float f8 = f8_product; // TODO: need round-toward-minus-inf
-+
-+    float f9 = f8 + c5_exact;
-+    float f10 = -f9;
-+
-+    // Cody-Waite reduction
-+    tmp = 0x3FB8AA3B; float log2e_hi_exact; memcpy(&log2e_hi_exact, &tmp, 4);
-+    tmp = 0x32A57060; float log2e_lo_exact; memcpy(&log2e_lo_exact, &tmp, 4);
-+
-+    float f12 = fmaf(x, log2e_hi_exact, f10);
-+    float f14 = fmaf(x, log2e_lo_exact, f12);
-+
-+    // 2^n via bit manipulation
-+    uint32_t r1;
-+    memcpy(&r1, &f8, 4);
-+    uint32_t r2 = r1 << 23;
-+    float f15;
-+    memcpy(&f15, &r2, 4);
-+
-+    // ex2.approx.ftz = exp2f(f14) — this is the hardware instruction
-+    // On CPU, use exp2f which should be very close
-+    float f16 = exp2f(f14);
-+
-+    return f16 * f15;
-+}
-+
-+__global__ void compute_native(const float *in, float *out, int n) {
-+    int i = blockDim.x * blockIdx.x + threadIdx.x;
-+    if (i < n) out[i] = expf(in[i]);
-+}
-+
-+int main() {
-+    const int N = 100000;
-+    float *h_in = new float[N], *h_gpu = new float[N];
-+    for (int i = 0; i < N; i++) h_in[i] = -20.0f + 40.0f * i / (N-1);
-+
-+    float *d_in, *d_out;
-+    cudaMalloc(&d_in, N*4); cudaMalloc(&d_out, N*4);
-+    cudaMemcpy(d_in, h_in, N*4, cudaMemcpyHostToDevice);
-+    compute_native<<<(N+255)/256, 256>>>(d_in, d_out, N);
-+    cudaMemcpy(h_gpu, d_out, N*4, cudaMemcpyDeviceToHost);
-+
-+    int exact = 0, off1 = 0;
-+    for (int i = 0; i < N; i++) {
-+        float cpu = expf_cuda_ptx(h_in[i]);
-+        uint32_t a, b;
-+        memcpy(&a, &cpu, 4); memcpy(&b, &h_gpu[i], 4);
-+        if (a == b) exact++;
-+        else if (abs((int)a-(int)b) <= 1) off1++;
-+    }
-+    printf("PTX-replica exact match: %d / %d\n", exact, N);
-+    printf("Off by 1 ULP: %d\n", off1);
-+    printf("Off by >1 ULP: %d\n", N - exact - off1);
-+
-+    delete[] h_in; delete[] h_gpu;
-+    cudaFree(d_in); cudaFree(d_out);
-+}
-diff --git a/tests/test-portable-expf.cu b/tests/test-portable-expf.cu
-new file mode 100644
-index 00000000..01a3c626
---- /dev/null
-+++ b/tests/test-portable-expf.cu
-@@ -0,0 +1,110 @@
-+// Portable expf using only FMA + basic IEEE ops — same result on CPU and GPU
-+// Based on Cody-Waite range reduction + Remez minimax polynomial
-+#include <cstdio>
-+#include <cstdint>
-+#include <cstring>
-+#include <cmath>
-+
-+// Portable expf: identical results on CPU and GPU when compiled with FMA
-+// Uses Cody-Waite range reduction + degree-6 minimax polynomial
-+#ifdef __CUDA_ARCH__
-+#define PORTABLE_FMA(a,b,c) __fmaf_rn(a,b,c)
-+#define PORTABLE_RINTF(x) rintf(x)
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index e9b6720c..35536237 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -1621,6 +1621,20 @@ void ggml_set_no_alloc(struct ggml_context * ctx, bool no_alloc) {
+     ctx->no_alloc = no_alloc;
+ }
+ 
++bool ggml_is_deterministic(void) {
++#ifdef GGML_DETERMINISTIC
++    return true;
 +#else
-+#define PORTABLE_FMA(a,b,c) fmaf(a,b,c)
-+#define PORTABLE_RINTF(x) rintf(x)
-+#endif
-+
-+static __host__ __device__ float expf_portable(float x) {
-+    // Clamp to avoid overflow/underflow
-+    x = fmaxf(x, -87.3f);
-+    x = fminf(x, 88.7f);
-+
-+    // Range reduction: exp(x) = 2^n * exp(r)
-+    // n = round(x / ln2), r = x - n*ln2
-+    const float log2e = 1.442695040888963f;
-+    const float ln2_hi = 0.693145751953125f;     // 24 bits, exact in float
-+    const float ln2_lo = 1.42860676533018e-06f;  // remainder
-+
-+    float n = PORTABLE_RINTF(x * log2e);
-+    float r = PORTABLE_FMA(n, -ln2_hi, x);     // r = x - n*ln2_hi (exact with FMA)
-+    r = PORTABLE_FMA(n, -ln2_lo, r);            // r = r - n*ln2_lo
-+
-+    // Minimax polynomial for exp(r)-1 on [-ln2/2, ln2/2], degree 5
-+    // exp(r) ≈ 1 + r + c2*r^2 + c3*r^3 + c4*r^4 + c5*r^5
-+    // Horner form: p = ((((c5*r + c4)*r + c3)*r + c2)*r + 1)*r + 1
-+    float p = 1.9875691500e-4f;
-+    p = PORTABLE_FMA(p, r, 1.3981999507e-3f);
-+    p = PORTABLE_FMA(p, r, 8.3334519073e-3f);
-+    p = PORTABLE_FMA(p, r, 4.1665795894e-2f);
-+    p = PORTABLE_FMA(p, r, 1.6666665459e-1f);
-+    p = PORTABLE_FMA(p, r, 5.0000001201e-1f);
-+    p = PORTABLE_FMA(p, r * r, r);  // p = p*r^2 + r
-+    p = p + 1.0f;                   // exp(r) ≈ p
-+
-+    // Reconstruct: exp(x) = p * 2^n via exponent manipulation
-+    int ni = (int)n;
-+    uint32_t bits;
-+    memcpy(&bits, &p, sizeof(bits));
-+    bits += (uint32_t)(ni) << 23;
-+    float result;
-+    memcpy(&result, &bits, sizeof(result));
-+    return result;
-+}
-+
-+__global__ void compute_portable_gpu(const float *in, float *out, int n) {
-+    int i = blockDim.x * blockIdx.x + threadIdx.x;
-+    if (i < n) out[i] = expf_portable(in[i]);
-+}
-+
-+__global__ void compute_expf_gpu(const float *in, float *out, int n) {
-+    int i = blockDim.x * blockIdx.x + threadIdx.x;
-+    if (i < n) out[i] = expf(in[i]);
-+}
-+
-+int main() {
-+    const int N = 100000;
-+    float *h_in = new float[N];
-+    float *h_gpu_native = new float[N];
-+    float *h_gpu_portable = new float[N];
-+
-+    for (int i = 0; i < N; i++)
-+        h_in[i] = -20.0f + 40.0f * i / (N - 1);
-+
-+    float *d_in, *d_out1, *d_out2;
-+    cudaMalloc(&d_in, N * sizeof(float));
-+    cudaMalloc(&d_out1, N * sizeof(float));
-+    cudaMalloc(&d_out2, N * sizeof(float));
-+    cudaMemcpy(d_in, h_in, N * sizeof(float), cudaMemcpyHostToDevice);
-+
-+    compute_expf_gpu<<<(N+255)/256, 256>>>(d_in, d_out1, N);
-+    compute_portable_gpu<<<(N+255)/256, 256>>>(d_in, d_out2, N);
-+    cudaMemcpy(h_gpu_native, d_out1, N * sizeof(float), cudaMemcpyDeviceToHost);
-+    cudaMemcpy(h_gpu_portable, d_out2, N * sizeof(float), cudaMemcpyDeviceToHost);
-+
-+    // Compare: CPU portable vs GPU portable (should be identical if FMA matches)
-+    // And: CPU portable vs GPU native (how close?)
-+    int cpu_gpu_portable_match = 0, cpu_gpu_native_match = 0, gpu_port_gpu_native = 0;
-+    int cpu_portable_off_by_1 = 0;
-+    for (int i = 0; i < N; i++) {
-+        float cpu_port = expf_portable(h_in[i]);
-+        uint32_t cp, gp, gn;
-+        memcpy(&cp, &cpu_port, 4);
-+        memcpy(&gp, &h_gpu_portable[i], 4);
-+        memcpy(&gn, &h_gpu_native[i], 4);
-+
-+        if (cp == gp) cpu_gpu_portable_match++;
-+        if (cp == gn) cpu_gpu_native_match++;
-+        if (gp == gn) gpu_port_gpu_native++;
-+        if (abs((int)cp - (int)gn) <= 1) cpu_portable_off_by_1++;
++    static int cached = -1;
++    if (cached == -1) {
++        const char * v = getenv("GGML_DETERMINISTIC");
++        cached = (v && (strcmp(v,"1")==0 || strcmp(v,"true")==0 || strcmp(v,"TRUE")==0 ||
++                        strcmp(v,"on")==0 || strcmp(v,"ON")==0 || strcmp(v,"yes")==0 || strcmp(v,"YES")==0)) ? 1 : 0;
 +    }
-+    printf("CPU_portable == GPU_portable: %d / %d (tests FMA parity)\n", cpu_gpu_portable_match, N);
-+    printf("CPU_portable == GPU_native:   %d / %d (our goal)\n", cpu_gpu_native_match, N);
-+    printf("GPU_portable == GPU_native:   %d / %d (polynomial quality)\n", gpu_port_gpu_native, N);
-+    printf("CPU_portable within 1 ULP of GPU_native: %d / %d\n", cpu_portable_off_by_1, N);
-+
-+    delete[] h_in;
-+    delete[] h_gpu_native;
-+    delete[] h_gpu_portable;
-+    cudaFree(d_in); cudaFree(d_out1); cudaFree(d_out2);
++    return cached == 1;
++#endif
 +}
++
+ void * ggml_get_mem_buffer(const struct ggml_context * ctx) {
+     return ctx->mem_buffer;
+ }
+diff --git a/gpu_tokens.txt b/gpu_tokens.txt
+new file mode 100644
+index 00000000..ede29ae8
+--- /dev/null
++++ b/gpu_tokens.txt
+@@ -0,0 +1,158 @@
++ggml_cuda_init: found 1 CUDA devices (Total VRAM: 24124 MiB):
++  Device 0: NVIDIA GeForce RTX 3090, compute capability 8.6, VMM: yes, VRAM: 24124 MiB
++build: 123 (7c203670) with GNU 11.4.0 for Linux x86_64
++llama_model_load_from_file_impl: using device CUDA0 (NVIDIA GeForce RTX 3090) (0000:01:00.0) - 23859 MiB free
++llama_model_loader: loaded meta data with 35 key-value pairs and 255 tensors from /media/amiller/fractal-nvme2/gguf-models/Llama-3.2-3B-Instruct-IQ4_XS.gguf (version GGUF V3 (latest))
++llama_model_loader: Dumping metadata keys/values. Note: KV overrides do not apply in this output.
++llama_model_loader: - kv   0:                       general.architecture str              = llama
++llama_model_loader: - kv   1:                               general.type str              = model
++llama_model_loader: - kv   2:                               general.name str              = Llama 3.2 3B Instruct
++llama_model_loader: - kv   3:                           general.finetune str              = Instruct
++llama_model_loader: - kv   4:                           general.basename str              = Llama-3.2
++llama_model_loader: - kv   5:                         general.size_label str              = 3B
++llama_model_loader: - kv   6:                            general.license str              = llama3.2
++llama_model_loader: - kv   7:                               general.tags arr[str,6]       = ["facebook", "meta", "pytorch", "llam...
++llama_model_loader: - kv   8:                          general.languages arr[str,8]       = ["en", "de", "fr", "it", "pt", "hi", ...
++llama_model_loader: - kv   9:                          llama.block_count u32              = 28
++llama_model_loader: - kv  10:                       llama.context_length u32              = 131072
++llama_model_loader: - kv  11:                     llama.embedding_length u32              = 3072
++llama_model_loader: - kv  12:                  llama.feed_forward_length u32              = 8192
++llama_model_loader: - kv  13:                 llama.attention.head_count u32              = 24
++llama_model_loader: - kv  14:              llama.attention.head_count_kv u32              = 8
++llama_model_loader: - kv  15:                       llama.rope.freq_base f32              = 500000.000000
++llama_model_loader: - kv  16:     llama.attention.layer_norm_rms_epsilon f32              = 0.000010
++llama_model_loader: - kv  17:                 llama.attention.key_length u32              = 128
++llama_model_loader: - kv  18:               llama.attention.value_length u32              = 128
++llama_model_loader: - kv  19:                          general.file_type u32              = 30
++llama_model_loader: - kv  20:                           llama.vocab_size u32              = 128256
++llama_model_loader: - kv  21:                 llama.rope.dimension_count u32              = 128
++llama_model_loader: - kv  22:                       tokenizer.ggml.model str              = gpt2
++llama_model_loader: - kv  23:                         tokenizer.ggml.pre str              = llama-bpe
++llama_model_loader: - kv  24:                      tokenizer.ggml.tokens arr[str,128256]  = ["!", "\"", "#", "$", "%", "&", "'", ...
++llama_model_loader: - kv  25:                  tokenizer.ggml.token_type arr[i32,128256]  = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, ...
++llama_model_loader: - kv  26:                      tokenizer.ggml.merges arr[str,280147]  = ["Ġ Ġ", "Ġ ĠĠĠ", "ĠĠ ĠĠ", "...
++llama_model_loader: - kv  27:                tokenizer.ggml.bos_token_id u32              = 128000
++llama_model_loader: - kv  28:                tokenizer.ggml.eos_token_id u32              = 128009
++llama_model_loader: - kv  29:                    tokenizer.chat_template str              = {{- bos_token }}\n{%- if custom_tools ...
++llama_model_loader: - kv  30:               general.quantization_version u32              = 2
++llama_model_loader: - kv  31:                      quantize.imatrix.file str              = /models_out/Llama-3.2-3B-Instruct-GGU...
++llama_model_loader: - kv  32:                   quantize.imatrix.dataset str              = /training_dir/calibration_datav3.txt
++llama_model_loader: - kv  33:             quantize.imatrix.entries_count i32              = 196
++llama_model_loader: - kv  34:              quantize.imatrix.chunks_count i32              = 125
++llama_model_loader: - type  f32:   58 tensors
++llama_model_loader: - type q6_K:    1 tensors
++llama_model_loader: - type iq4_xs:  196 tensors
++print_info: file format = GGUF V3 (latest)
++print_info: file type   = IQ4_XS - 4.25 bpw
++print_info: file size   = 1.70 GiB (4.54 BPW) 
++load: 0 unused tokens
++load: printing all EOG tokens:
++load:   - 128001 ('<|end_of_text|>')
++load:   - 128008 ('<|eom_id|>')
++load:   - 128009 ('<|eot_id|>')
++load: special tokens cache size = 256
++load: token to piece cache size = 0.7999 MB
++print_info: arch                  = llama
++print_info: vocab_only            = 0
++print_info: no_alloc              = 0
++print_info: n_ctx_train           = 131072
++print_info: n_embd                = 3072
++print_info: n_embd_inp            = 3072
++print_info: n_layer               = 28
++print_info: n_head                = 24
++print_info: n_head_kv             = 8
++print_info: n_rot                 = 128
++print_info: n_swa                 = 0
++print_info: is_swa_any            = 0
++print_info: n_embd_head_k         = 128
++print_info: n_embd_head_v         = 128
++print_info: n_gqa                 = 3
++print_info: n_embd_k_gqa          = 1024
++print_info: n_embd_v_gqa          = 1024
++print_info: f_norm_eps            = 0.0e+00
++print_info: f_norm_rms_eps        = 1.0e-05
++print_info: f_clamp_kqv           = 0.0e+00
++print_info: f_max_alibi_bias      = 0.0e+00
++print_info: f_logit_scale         = 0.0e+00
++print_info: f_attn_scale          = 0.0e+00
++print_info: n_ff                  = 8192
++print_info: n_expert              = 0
++print_info: n_expert_used         = 0
++print_info: n_expert_groups       = 0
++print_info: n_group_used          = 0
++print_info: causal attn           = 1
++print_info: pooling type          = -1
++print_info: rope type             = 0
++print_info: rope scaling          = linear
++print_info: freq_base_train       = 500000.0
++print_info: freq_scale_train      = 1
++print_info: n_ctx_orig_yarn       = 131072
++print_info: rope_yarn_log_mul     = 0.0000
++print_info: rope_finetuned        = unknown
++print_info: model type            = 3B
++print_info: model params          = 3.21 B
++print_info: general.name          = Llama 3.2 3B Instruct
++print_info: vocab type            = BPE
++print_info: n_vocab               = 128256
++print_info: n_merges              = 280147
++print_info: BOS token             = 128000 '<|begin_of_text|>'
++print_info: EOS token             = 128009 '<|eot_id|>'
++print_info: EOT token             = 128009 '<|eot_id|>'
++print_info: EOM token             = 128008 '<|eom_id|>'
++print_info: LF token              = 198 'Ċ'
++print_info: EOG token             = 128001 '<|end_of_text|>'
++print_info: EOG token             = 128008 '<|eom_id|>'
++print_info: EOG token             = 128009 '<|eot_id|>'
++print_info: max token length      = 256
++load_tensors: loading model tensors, this can take a while... (mmap = true, direct_io = false)
++load_tensors: offloading output layer to GPU
++load_tensors: offloading 27 repeating layers to GPU
++load_tensors: offloaded 29/29 layers to GPU
++load_tensors:   CPU_Mapped model buffer size =   308.23 MiB
++load_tensors:        CUDA0 model buffer size =  1736.90 MiB
++........................................................................
++llama_context: constructing llama_context
++llama_context: n_seq_max     = 1
++llama_context: n_ctx         = 131072
++llama_context: n_ctx_seq     = 131072
++llama_context: n_batch       = 2048
++llama_context: n_ubatch      = 512
++llama_context: causal_attn   = 1
++llama_context: flash_attn    = auto
++llama_context: kv_unified    = false
++llama_context: freq_base     = 500000.0
++llama_context: freq_scale    = 1
++llama_context:  CUDA_Host  output buffer size =     0.49 MiB
++llama_kv_cache:      CUDA0 KV buffer size = 14336.00 MiB
++llama_kv_cache: size = 14336.00 MiB (131072 cells,  28 layers,  1/1 seqs), K (f16): 7168.00 MiB, V (f16): 7168.00 MiB
++sched_reserve: reserving ...
++sched_reserve: Flash Attention was auto, set to enabled
++sched_reserve: resolving fused Gated Delta Net support:
++sched_reserve: fused Gated Delta Net (autoregressive) enabled
++sched_reserve: fused Gated Delta Net (chunked) enabled
++sched_reserve:      CUDA0 compute buffer size =   408.01 MiB
++sched_reserve:  CUDA_Host compute buffer size =   268.01 MiB
++sched_reserve: graph nodes  = 875
++sched_reserve: graph splits = 2
++sched_reserve: reserve took 68.73 ms, sched copies = 1
++Token 0: id=627 '.
++'
++Token 1: id=791 'The'
++Token 2: id=4062 ' quick'
++Token 3: id=14198 ' brown'
++Token 4: id=39935 ' fox'
++Token 5: id=35308 ' jumps'
++Token 6: id=927 ' over'
++Token 7: id=279 ' the'
++Token 8: id=16053 ' lazy'
++Token 9: id=5679 ' dog'
++Token 10: id=13 '.'
++Token 11: id=578 ' The'
++Token 12: id=4062 ' quick'
++Token 13: id=14198 ' brown'
++Token 14: id=39935 ' fox'
++Token 15: id=35308 ' jumps'
++Token 16: id=927 ' over'
++Token 17: id=279 ' the'
++Token 18: id=16053 ' lazy'
++Token 19: id=5679 ' dog'
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index f6ce2817..fb8778ad 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1,5 +1,6 @@
+ #include "llama-context.h"
+ 
++#include "ggml.h"
+ #include "llama-arch.h"
+ #include "llama-impl.h"
+ #include "llama-batch.h"
+@@ -151,9 +152,9 @@ llama_context::llama_context(
+     cparams.flash_attn = params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED;
+     cparams.auto_fa    = params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO;
+ 
+-    cparams.fused_gdn_ar = true;
+-    cparams.fused_gdn_ch = true;
+-    cparams.auto_fgdn    = true;
++    cparams.fused_gdn_ar = !ggml_is_deterministic();
++    cparams.fused_gdn_ch = !ggml_is_deterministic();
++    cparams.auto_fgdn    = !ggml_is_deterministic();
+ 
+     // with causal attention, the batch size is limited by the context size
+     cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
 diff --git a/tools/CMakeLists.txt b/tools/CMakeLists.txt
-index d64956b8..bcfcc05c 100644
+index b433c91d..562bf8b4 100644
 --- a/tools/CMakeLists.txt
 +++ b/tools/CMakeLists.txt
-@@ -26,6 +26,7 @@ else()
+@@ -39,4 +39,5 @@ else()
      endif()
-     add_subdirectory(run)
-     add_subdirectory(tokenize)
+     add_subdirectory(fit-params)
+     add_subdirectory(results)
 +    add_subdirectory(det-diag)
-     add_subdirectory(tts)
-     add_subdirectory(mtmd)
-     if (GGML_RPC)
+ endif()
 diff --git a/tools/det-diag/CMakeLists.txt b/tools/det-diag/CMakeLists.txt
 new file mode 100644
 index 00000000..777f194d
@@ -1799,176 +3182,14 @@ index 00000000..777f194d
 +install(TARGETS ${TARGET} RUNTIME)
 +target_link_libraries(${TARGET} PRIVATE common llama ${CMAKE_THREAD_LIBS_INIT})
 +target_compile_features(${TARGET} PRIVATE cxx_std_17)
-diff --git a/tools/det-diag/det-diag.cpp b/tools/det-diag/det-diag.cpp
-new file mode 100644
-index 00000000..28297a98
---- /dev/null
-+++ b/tools/det-diag/det-diag.cpp
-@@ -0,0 +1,124 @@
-+// Deterministic diagnostics: hash every tensor during inference
-+// Run on GPU and CPU builds, diff output to find first diverging operation
-+#include "arg.h"
-+#include "common.h"
-+#include "sampling.h"
-+#include "llama.h"
-+#include "ggml.h"
-+#include "ggml-backend.h"
-+#include <cstdio>
-+#include <cstdint>
-+#include <cstring>
-+#include <vector>
-+
-+static uint32_t fnv1a(const void * data, size_t len) {
-+    uint32_t h = 2166136261u;
-+    const uint8_t * p = (const uint8_t *)data;
-+    for (size_t i = 0; i < len; i++) {
-+        h ^= p[i];
-+        h *= 16777619u;
-+    }
-+    return h;
-+}
-+
-+struct diag_state {
-+    int token_idx;
-+};
-+
-+static bool tensor_callback(struct ggml_tensor * t, bool ask, void * user_data) {
-+    if (ask) return true;
-+
-+    auto * state = (diag_state *)user_data;
-+    size_t nbytes = ggml_nbytes(t);
-+    std::vector<uint8_t> buf(nbytes);
-+    ggml_backend_tensor_get(t, buf.data(), 0, nbytes);
-+
-+    uint32_t hash = fnv1a(buf.data(), nbytes);
-+
-+    // first 2 floats for quick eyeball comparison
-+    float f0 = 0, f1 = 0;
-+    if (nbytes >= 4) memcpy(&f0, buf.data(), 4);
-+    if (nbytes >= 8) memcpy(&f1, buf.data() + 4, 4);
-+
-+    printf("T%d %-40s [%5lld×%-5lld] %08x  %.8e %.8e\n",
-+        state->token_idx, ggml_get_name(t),
-+        (long long)t->ne[0], (long long)t->ne[1],
-+        hash, f0, f1);
-+
-+    // For attention output, dump at token boundaries
-+    const char *name = ggml_get_name(t);
-+    if (name && strstr(name, "__fattn__") && state->token_idx == 0) {
-+        printf("  DIMS [%lld,%lld,%lld,%lld]\n", (long long)t->ne[0], (long long)t->ne[1], (long long)t->ne[2], (long long)t->ne[3]);
-+        // Dump first 4 floats at each token: offset = token * ne[0] * ne[1]
-+        int stride = t->ne[0] * t->ne[1]; // 128*16 = 2048 per token
-+        for (int tok = 0; tok < 4 && tok < t->ne[2]; tok++) {
-+            int off = tok * stride;
-+            printf("  TOK%d@%d", tok, off);
-+            for (int i = 0; i < 4; i++) {
-+                uint32_t v; memcpy(&v, buf.data() + (off+i)*4, 4);
-+                printf(" %08x", v);
-+            }
-+            printf("\n");
-+        }
-+    }
-+
-+    return true;
-+}
-+
-+static void print_usage(int, char **) {}
-+
-+int main(int argc, char ** argv) {
-+    common_params params;
-+    if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_MAIN, print_usage)) return 1;
-+    common_init();
-+
-+    if (params.n_predict < 0) params.n_predict = 3;
-+    params.cpuparams.n_threads = 1;
-+
-+    diag_state state = { 0 };
-+    params.cb_eval = tensor_callback;
-+    params.cb_eval_user_data = &state;
-+
-+    auto mparams = common_model_params_to_llama(params);
-+    auto * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
-+    if (!model) return 1;
-+
-+    auto cparams = common_context_params_to_llama(params);
-+    auto * ctx = llama_init_from_model(model, cparams);
-+    if (!ctx) return 1;
-+
-+    const auto * vocab = llama_model_get_vocab(model);
-+    auto tokens = common_tokenize(vocab, params.prompt, true);
-+
-+    auto batch = llama_batch_init(tokens.size() + params.n_predict, 0, 1);
-+    for (size_t i = 0; i < tokens.size(); i++)
-+        common_batch_add(batch, tokens[i], i, {0}, false);
-+    batch.logits[tokens.size() - 1] = true;
-+
-+    printf("# PROMPT EVAL (%zu tokens)\n", tokens.size());
-+    state.token_idx = 0;
-+    llama_decode(ctx, batch);
-+
-+    auto * smpl = common_sampler_init(model, params.sampling);
-+    for (int i = 0; i < params.n_predict; i++) {
-+        llama_token id = common_sampler_sample(smpl, ctx, -1);
-+        if (llama_vocab_is_eog(vocab, id)) break;
-+
-+        char buf[64];
-+        int len = llama_token_to_piece(vocab, id, buf, sizeof(buf) - 1, 0, true);
-+        buf[len] = 0;
-+        fprintf(stderr, "Token %d: id=%d '%s'\n", i, id, buf);
-+
-+        common_batch_clear(batch);
-+        common_batch_add(batch, id, tokens.size() + i, {0}, true);
-+
-+        state.token_idx = i + 1;
-+        printf("# TOKEN %d (id=%d)\n", i + 1, id);
-+        llama_decode(ctx, batch);
-+    }
-+
-+    common_sampler_free(smpl);
-+    llama_batch_free(batch);
-+    llama_free(ctx);
-+    llama_model_free(model);
-+}
--- 
-2.34.1
-
-
-From e8fa21bbc79e49012dfc3ddd7590adbc5a1fea33 Mon Sep 17 00:00:00 2001
-From: Andrew Miller <soc1024@illinois.edu>
-Date: Sun, 29 Mar 2026 13:06:08 -0400
-Subject: [PATCH 2/6] Add Docker verifier and example seeds for deterministic
- parity
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
-
-- Dockerfile: multi-stage build producing minimal CPU verifier image
-- verify.sh: one-command verification of (model, seed, prompt) → output
-- README: quick start, example seeds, technical overview
-
-Example verified seeds (qwen2.5-3b Q4_K_M, temp=0.7):
-  seed=2024: "Once upon a time, a little mouse used to go to the cinema..."
-  seed=42:   "Once upon a time, there was a boy named Ivan..."
-  seed=777:  "Once upon a time, there was a king who had a problem..."
-
-Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
----
- tools/det-diag/Dockerfile | 21 +++++++++
- tools/det-diag/README.md  | 90 +++++++++++++++++++++++++++++++++++++++
- tools/det-diag/verify.sh  | 71 ++++++++++++++++++++++++++++++
- 3 files changed, 182 insertions(+)
- create mode 100644 tools/det-diag/Dockerfile
- create mode 100644 tools/det-diag/README.md
- create mode 100755 tools/det-diag/verify.sh
-
 diff --git a/tools/det-diag/Dockerfile b/tools/det-diag/Dockerfile
 new file mode 100644
-index 00000000..20af61b2
+index 00000000..7e7cfda9
 --- /dev/null
 +++ b/tools/det-diag/Dockerfile
 @@ -0,0 +1,21 @@
 +FROM ubuntu:22.04 AS builder
-+RUN apt-get update && apt-get install -y build-essential cmake git && rm -rf /var/lib/apt/lists/*
++RUN apt-get update && apt-get install -y build-essential cmake git libcurl4-openssl-dev && rm -rf /var/lib/apt/lists/*
 +
 +COPY . /src
 +WORKDIR /src
@@ -1983,7 +3204,7 @@ index 00000000..20af61b2
 +  && cmake --build build --target llama-det-diag -j$(nproc)
 +
 +FROM ubuntu:22.04
-+RUN apt-get update && apt-get install -y libgomp1 && rm -rf /var/lib/apt/lists/*
++RUN apt-get update && apt-get install -y libgomp1 libcurl4 && rm -rf /var/lib/apt/lists/*
 +COPY --from=builder /src/build/bin/llama-det-diag /usr/local/bin/
 +COPY --from=builder /src/build/bin/*.so* /usr/local/lib/
 +ENV LD_LIBRARY_PATH=/usr/local/lib
@@ -2084,6 +3305,156 @@ index 00000000..595edafa
 +Currently verified for **Q4_K_M** quantization (uses Q4_K and Q6_K weight types).
 +Other quantization types (IQ4_XS, Q5_K, Q8_0) need additional deterministic
 +dot product implementations.
+diff --git a/tools/det-diag/det-diag.cpp b/tools/det-diag/det-diag.cpp
+new file mode 100644
+index 00000000..5df586ef
+--- /dev/null
++++ b/tools/det-diag/det-diag.cpp
+@@ -0,0 +1,144 @@
++// Deterministic diagnostics: hash every tensor during inference
++// Run on GPU and CPU builds, diff output to find first diverging operation
++#include "arg.h"
++#include "common.h"
++#include "sampling.h"
++#include "llama.h"
++#include "ggml.h"
++#include "ggml-backend.h"
++#include <cstdio>
++#include <cstdint>
++#include <cstring>
++#include <vector>
++
++static uint32_t fnv1a(const void * data, size_t len) {
++    uint32_t h = 2166136261u;
++    const uint8_t * p = (const uint8_t *)data;
++    for (size_t i = 0; i < len; i++) {
++        h ^= p[i];
++        h *= 16777619u;
++    }
++    return h;
++}
++
++struct diag_state {
++    int token_idx;
++};
++
++static bool tensor_callback(struct ggml_tensor * t, bool ask, void * user_data) {
++    if (ask) return true;
++
++    auto * state = (diag_state *)user_data;
++    size_t nbytes = ggml_nbytes(t);
++    std::vector<uint8_t> buf(nbytes);
++    ggml_backend_tensor_get(t, buf.data(), 0, nbytes);
++
++    uint32_t hash = fnv1a(buf.data(), nbytes);
++
++    // first 2 floats for quick eyeball comparison
++    float f0 = 0, f1 = 0;
++    if (nbytes >= 4) memcpy(&f0, buf.data(), 4);
++    if (nbytes >= 8) memcpy(&f1, buf.data() + 4, 4);
++
++    printf("T%d %-40s [%5lld×%-5lld] %08x  %.8e %.8e\n",
++        state->token_idx, ggml_get_name(t),
++        (long long)t->ne[0], (long long)t->ne[1],
++        hash, f0, f1);
++
++    // For attention output, dump at token boundaries
++    const char *name = ggml_get_name(t);
++
++    // Dump first attention tensor at T1 to file for binary comparison
++    {
++        const char *dump_env = getenv("DET_DUMP_FILE");
++        if (dump_env && name && strstr(name, "__fattn__") && state->token_idx == 1) {
++            static int fattn_count = 0;
++            if (fattn_count == 0) {
++                FILE *fp = fopen(dump_env, "wb");
++                if (fp) {
++                    fwrite(buf.data(), 1, nbytes, fp);
++                    fclose(fp);
++                    fprintf(stderr, "[DUMP] wrote %zu bytes to %s for %s\n", nbytes, dump_env, name);
++                }
++            }
++            fattn_count++;
++        }
++    }
++    if (name && (strstr(name, "__fattn__") || strstr(name, "ffn_moe_gate") || strstr(name, "ffn_moe_logits") || strstr(name, "ffn_moe_probs")) && state->token_idx == 0) {
++        printf("  DIMS [%lld,%lld,%lld,%lld]\n", (long long)t->ne[0], (long long)t->ne[1], (long long)t->ne[2], (long long)t->ne[3]);
++        // Dump first 4 floats at each column (expert/token)
++        int stride = t->ne[0]; // ne[0] per column
++        int ncols = t->ne[1];
++        if (ncols > 8) ncols = 8;
++        for (int col = 0; col < ncols; col++) {
++            int off = col * stride;
++            if ((off + 4) * 4 > (int)nbytes) break;
++            printf("  COL%d@%d", col, off);
++            for (int i = 0; i < 4; i++) {
++                uint32_t v; memcpy(&v, buf.data() + (off+i)*4, 4);
++                printf(" %08x", v);
++            }
++            printf("\n");
++        }
++    }
++
++    return true;
++}
++
++static void print_usage(int, char **) {}
++
++int main(int argc, char ** argv) {
++    common_params params;
++    if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_COMMON, print_usage)) return 1;
++    common_init();
++
++    if (params.n_predict < 0) params.n_predict = 3;
++    params.cpuparams.n_threads = 1;
++
++    diag_state state = { 0 };
++    params.cb_eval = tensor_callback;
++    params.cb_eval_user_data = &state;
++
++    auto mparams = common_model_params_to_llama(params);
++    auto * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
++    if (!model) return 1;
++
++    auto cparams = common_context_params_to_llama(params);
++    auto * ctx = llama_init_from_model(model, cparams);
++    if (!ctx) return 1;
++
++    const auto * vocab = llama_model_get_vocab(model);
++    auto tokens = common_tokenize(vocab, params.prompt, true);
++
++    auto batch = llama_batch_init(tokens.size() + params.n_predict, 0, 1);
++    for (size_t i = 0; i < tokens.size(); i++)
++        common_batch_add(batch, tokens[i], i, {0}, false);
++    batch.logits[tokens.size() - 1] = true;
++
++    printf("# PROMPT EVAL (%zu tokens)\n", tokens.size());
++    state.token_idx = 0;
++    llama_decode(ctx, batch);
++
++    auto * smpl = common_sampler_init(model, params.sampling);
++    for (int i = 0; i < params.n_predict; i++) {
++        llama_token id = common_sampler_sample(smpl, ctx, -1);
++        if (llama_vocab_is_eog(vocab, id)) break;
++
++        char buf[64];
++        int len = llama_token_to_piece(vocab, id, buf, sizeof(buf) - 1, 0, true);
++        buf[len] = 0;
++        fprintf(stderr, "Token %d: id=%d '%s'\n", i, id, buf);
++
++        common_batch_clear(batch);
++        common_batch_add(batch, id, tokens.size() + i, {0}, true);
++
++        state.token_idx = i + 1;
++        printf("# TOKEN %d (id=%d)\n", i + 1, id);
++        llama_decode(ctx, batch);
++    }
++
++    common_sampler_free(smpl);
++    llama_batch_free(batch);
++    llama_free(ctx);
++    llama_model_free(model);
++}
 diff --git a/tools/det-diag/verify.sh b/tools/det-diag/verify.sh
 new file mode 100755
 index 00000000..ab289532
@@ -2161,482 +3532,6 @@ index 00000000..ab289532
 +    echo "✗ MISMATCH — output differs from expected"
 +    exit 1
 +fi
--- 
-2.34.1
-
-
-From b99f7e41c3a739e4ce407e4b488184caddbe4501 Mon Sep 17 00:00:00 2001
-From: Andrew Miller <soc1024@illinois.edu>
-Date: Sun, 29 Mar 2026 13:17:02 -0400
-Subject: [PATCH 3/6] Fix Dockerfile: add libcurl deps for build and runtime
-
-Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
----
- tools/det-diag/Dockerfile | 4 ++--
- 1 file changed, 2 insertions(+), 2 deletions(-)
-
-diff --git a/tools/det-diag/Dockerfile b/tools/det-diag/Dockerfile
-index 20af61b2..7e7cfda9 100644
---- a/tools/det-diag/Dockerfile
-+++ b/tools/det-diag/Dockerfile
-@@ -1,5 +1,5 @@
- FROM ubuntu:22.04 AS builder
--RUN apt-get update && apt-get install -y build-essential cmake git && rm -rf /var/lib/apt/lists/*
-+RUN apt-get update && apt-get install -y build-essential cmake git libcurl4-openssl-dev && rm -rf /var/lib/apt/lists/*
- 
- COPY . /src
- WORKDIR /src
-@@ -14,7 +14,7 @@ RUN cmake -B build \
-   && cmake --build build --target llama-det-diag -j$(nproc)
- 
- FROM ubuntu:22.04
--RUN apt-get update && apt-get install -y libgomp1 && rm -rf /var/lib/apt/lists/*
-+RUN apt-get update && apt-get install -y libgomp1 libcurl4 && rm -rf /var/lib/apt/lists/*
- COPY --from=builder /src/build/bin/llama-det-diag /usr/local/bin/
- COPY --from=builder /src/build/bin/*.so* /usr/local/lib/
- ENV LD_LIBRARY_PATH=/usr/local/lib
--- 
-2.34.1
-
-
-From ef04735c9d926eb0dd3ba4026903aaafbee714d2 Mon Sep 17 00:00:00 2001
-From: Andrew Miller <soc1024@illinois.edu>
-Date: Sun, 29 Mar 2026 17:55:26 -0400
-Subject: [PATCH 4/6] MoE partial parity: F32 router matmul, softmax butterfly,
- per-column mmvq
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
-
-MoE model (Qwen3-Coder-30B-A3B Q4_K_M) progress:
-- 37 consecutive tensors match (all attention + norms + MoE router + softmax)
-- F32 det dot product matching GPU mmvf warp-parallel accumulation
-- Softmax expf_det + butterfly kqsum on both GPU and CPU
-- Force mmvq for all batch sizes (bypass mmq when deterministic)
-- Route F32 matmuls through mmvf_det when deterministic
-
-Remaining: expert Q4_K matmuls via mul_mat_id diverge despite using
-the same mmvq ncols=1 kernel as the dense model (which matches 100%).
-The dispatch path is confirmed correct — the divergence is likely in
-how src1 is quantized or laid out in the mul_mat_id context.
-
-Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
----
- ggml/src/ggml-cpu/ggml-cpu.c                  |  1 +
- ggml/src/ggml-cpu/ops.cpp                     | 55 +++++++++++++--
- ggml/src/ggml-cpu/quants.c                    | 68 +++++++++++++++++++
- ggml/src/ggml-cpu/quants.h                    |  1 +
- ggml/src/ggml-cuda/ggml-cuda.cu               |  8 ++-
- ggml/src/ggml-cuda/softmax.cu                 |  9 +++
- .../memory/project_nemotron_benchmark.md      | 16 +++++
- 7 files changed, 151 insertions(+), 7 deletions(-)
- create mode 100644 projects/-home-amiller-installing-ollama/memory/project_nemotron_benchmark.md
-
-diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
-index 6f03dd82..58a0622f 100644
---- a/ggml/src/ggml-cpu/ggml-cpu.c
-+++ b/ggml/src/ggml-cpu/ggml-cpu.c
-@@ -396,6 +396,7 @@ static inline ggml_vec_dot_t det_vec_dot(enum ggml_type src0_type) {
-     if (ggml_is_deterministic()) {
-         if (src0_type == GGML_TYPE_Q4_K) vd = ggml_vec_dot_q4_K_q8_1_det;
-         if (src0_type == GGML_TYPE_Q6_K) vd = ggml_vec_dot_q6_K_q8_1_det;
-+        if (src0_type == GGML_TYPE_F32)  vd = ggml_vec_dot_f32_det;
-     }
-     return vd;
- }
-diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
-index 4c640e76..ba4f88f1 100644
---- a/ggml/src/ggml-cpu/ops.cpp
-+++ b/ggml/src/ggml-cpu/ops.cpp
-@@ -6006,14 +6006,57 @@ static void ggml_compute_forward_soft_max_f32(
- 
-                 float sumf;
-                 if (ggml_is_deterministic()) {
--                    // GPU softmax accumulates in float, not double — match it
--                    sumf = 0.0f;
-+                    // GPU softmax: expf_det + warp_reduce_sum for denominator
-                     for (int i = 0; i < ne00; ++i) {
--                        float val = expf(wp[i] - max);
--                        dp[i] = val;
--                        sumf += val;
-+                        dp[i] = expf_det(wp[i] - max);
-                     }
--                    if (sk) sumf += expf(sk[i02] - max);
-+                    // Match GPU's warp+inter-warp butterfly reduction for the sum
-+                    // GPU softmax uses block_size threads, each accumulates ne00/block_size elements
-+                    int block_size = 32;
-+                    for (int bs = 64; bs <= 256 && bs <= ne00; bs += 32) {
-+                        if ((ne00 + bs - 1) / bs < (ne00 + block_size - 1) / block_size)
-+                            block_size = bs;
-+                    }
-+                    const int WARP_SIZE = 32;
-+                    const int nwarps = block_size / WARP_SIZE;
-+                    float thread_sums[256];
-+                    for (int tid = 0; tid < block_size; tid++) {
-+                        float s = 0.0f;
-+                        for (int col = tid; col < ne00; col += block_size)
-+                            s += dp[col];
-+                        thread_sums[tid] = s;
-+                    }
-+                    // Per-warp butterfly
-+                    float warp_results[8];
-+                    for (int w = 0; w < nwarps; w++) {
-+                        float buf[2][32];
-+                        memcpy(buf[0], &thread_sums[w*WARP_SIZE], WARP_SIZE*sizeof(float));
-+                        int cur = 0;
-+                        for (int off = WARP_SIZE/2; off > 0; off >>= 1) {
-+                            int nxt = 1 - cur;
-+                            for (int lane = 0; lane < WARP_SIZE; lane++)
-+                                buf[nxt][lane] = buf[cur][lane] + buf[cur][lane ^ off];
-+                            cur = nxt;
-+                        }
-+                        warp_results[w] = buf[cur][0];
-+                    }
-+                    // Inter-warp butterfly
-+                    if (nwarps > 1) {
-+                        float ibuf[2][32];
-+                        for (int i = 0; i < WARP_SIZE; i++)
-+                            ibuf[0][i] = (i < nwarps) ? warp_results[i] : 0.0f;
-+                        int cur = 0;
-+                        for (int off = WARP_SIZE/2; off > 0; off >>= 1) {
-+                            int nxt = 1 - cur;
-+                            for (int lane = 0; lane < WARP_SIZE; lane++)
-+                                ibuf[nxt][lane] = ibuf[cur][lane] + ibuf[cur][lane ^ off];
-+                            cur = nxt;
-+                        }
-+                        sumf = ibuf[cur][0];
-+                    } else {
-+                        sumf = warp_results[0];
-+                    }
-+                    if (sk) sumf += expf_det(sk[i02] - max);
-                     sumf = 1.0f / sumf;
-                 } else {
-                     ggml_float sum = ggml_vec_soft_max_f32(ne00, dp, wp, max);
-diff --git a/ggml/src/ggml-cpu/quants.c b/ggml/src/ggml-cpu/quants.c
-index 7072152a..2290f859 100644
---- a/ggml/src/ggml-cpu/quants.c
-+++ b/ggml/src/ggml-cpu/quants.c
-@@ -716,6 +716,74 @@ void ggml_vec_dot_q4_K_q8_1_det(int n, float * GGML_RESTRICT s, size_t bs, const
-     *s = buf[cur][0];
- }
- 
-+// Deterministic F32 dot product matching GPU mmvf kernel accumulation order.
-+// GPU: block_size threads, each accumulates n/(2*block_size) float2 pairs, then warp+inter-warp reduce.
-+void ggml_vec_dot_f32_det(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
-+    assert(nrc == 1);
-+    UNUSED(nrc); UNUSED(bx); UNUSED(by); UNUSED(bs);
-+
-+    const float * x = vx;
-+    const float * y = vy;
-+    const int ncols2 = n / 2;
-+
-+    // Match GPU: block_size chosen to minimize iterations (same heuristic as mmvf.cu)
-+    int block_size = 32;
-+    for (int bs_try = 64; bs_try <= 256; bs_try += 32) {
-+        if ((ncols2 + bs_try - 1) / bs_try < (ncols2 + block_size - 1) / block_size)
-+            block_size = bs_try;
-+    }
-+
-+    const int WARP_SIZE = 32;
-+    const int nwarps = block_size / WARP_SIZE;
-+
-+    // Phase 1: per-thread accumulation (float2 pairs)
-+    float tmp[256]; // max block_size
-+    for (int tid = 0; tid < block_size; tid++) {
-+        float sum = 0.0f;
-+        for (int col2 = tid; col2 < ncols2; col2 += block_size) {
-+            sum += x[2*col2]   * y[2*col2];
-+            sum += x[2*col2+1] * y[2*col2+1];
-+        }
-+        tmp[tid] = sum;
-+    }
-+
-+    // Phase 2: warp butterfly reduction
-+    float warp_sums[8]; // max nwarps
-+    for (int w = 0; w < nwarps; w++) {
-+        float buf[2][32];
-+        memcpy(buf[0], &tmp[w * WARP_SIZE], WARP_SIZE * sizeof(float));
-+        int cur = 0;
-+        for (int off = WARP_SIZE/2; off > 0; off >>= 1) {
-+            int nxt = 1 - cur;
-+            for (int lane = 0; lane < WARP_SIZE; lane++)
-+                buf[nxt][lane] = buf[cur][lane] + buf[cur][lane ^ off];
-+            cur = nxt;
-+        }
-+        warp_sums[w] = buf[cur][0];
-+    }
-+
-+    // Phase 3: inter-warp reduction (warp 0 accumulates, then butterfly)
-+    if (nwarps > 1) {
-+        float iw = warp_sums[0];
-+        for (int w = 1; w < nwarps; w++) iw += warp_sums[w];
-+        // GPU does: buf_iw[tid/warp_size] = sumf; then warp 0 reads buf_iw[tid] and reduces
-+        // For nwarps <= 32, this is equivalent to sequential add then one more butterfly
-+        // But the GPU's inter-warp is: load nwarps values into warp 0's lanes, butterfly
-+        float ibuf[2][32];
-+        for (int i = 0; i < WARP_SIZE; i++) ibuf[0][i] = (i < nwarps) ? warp_sums[i] : 0.0f;
-+        int cur = 0;
-+        for (int off = WARP_SIZE/2; off > 0; off >>= 1) {
-+            int nxt = 1 - cur;
-+            for (int lane = 0; lane < WARP_SIZE; lane++)
-+                ibuf[nxt][lane] = ibuf[cur][lane] + ibuf[cur][lane ^ off];
-+            cur = nxt;
-+        }
-+        *s = ibuf[cur][0];
-+    } else {
-+        *s = warp_sums[0];
-+    }
-+}
-+
- void ggml_vec_dot_q5_K_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy,  size_t by, int nrc) {
-     assert(n % QK_K == 0);
-     assert(nrc == 1);
-diff --git a/ggml/src/ggml-cpu/quants.h b/ggml/src/ggml-cpu/quants.h
-index d1402bfd..5ad89458 100644
---- a/ggml/src/ggml-cpu/quants.h
-+++ b/ggml/src/ggml-cpu/quants.h
-@@ -48,6 +48,7 @@ void ggml_vec_dot_q3_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const voi
- void ggml_vec_dot_q4_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
- void ggml_vec_dot_q4_K_q8_1_det(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
- void ggml_vec_dot_q6_K_q8_1_det(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
-+void ggml_vec_dot_f32_det(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
- void ggml_vec_dot_q5_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
- void ggml_vec_dot_q6_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
- 
-diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 22bae547..6d118337 100644
---- a/ggml/src/ggml-cuda/ggml-cuda.cu
-+++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -2078,13 +2078,18 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
-         use_batched_cublas_f32 = false;
-     }
- 
--    if (!split && use_mul_mat_vec_f) {
-+    if (!split && use_mul_mat_vec_f && ggml_is_deterministic()) {
-+        // Route F32/F16 matmuls through the deterministic mmvf kernel for CPU-GPU parity
-+
-+        ggml_cuda_op_mul_mat(ctx, src0, src1, dst, ggml_cuda_op_mul_mat_mmvf_det, nullptr);
-+    } else if (!split && use_mul_mat_vec_f) {
-         // the custom F16 vector kernel can be used over batched cuBLAS GEMM
-         // but this is only faster for GPUs without tensor cores or with a thin src0 matrix (particularly KQV in attention)
-         ggml_cuda_mul_mat_vec_f(ctx, src0, src1, nullptr, dst);
-     } else if (!split && use_mul_mat_f) {
-         ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
-     } else if (!split && use_mul_mat_vec_q) {
-+
-         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
-     } else if (!split && use_mul_mat_q) {
-         ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
-@@ -2129,6 +2134,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
-     // same principle as attention/matmul: keep the reduction order and dtype
-     // stable, trading some throughput for reproducibility.
-     if (ggml_is_deterministic() && (src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16 || src1->type == GGML_TYPE_BF16) && dst->type == GGML_TYPE_F32) {
-+
-         // ids is on device; copy raw bytes to host (preserving strides)
-         cudaStream_t stream = ctx.stream();
-         std::vector<char> ids_h(ggml_nbytes(ids));
-diff --git a/ggml/src/ggml-cuda/softmax.cu b/ggml/src/ggml-cuda/softmax.cu
-index eeacde0b..fab4ebac 100644
---- a/ggml/src/ggml-cuda/softmax.cu
-+++ b/ggml/src/ggml-cuda/softmax.cu
-@@ -1,6 +1,7 @@
- #include "common.cuh"
- #include "ggml.h"
- #include "softmax.cuh"
-+#include "ggml-deterministic.h"
- #include <cstdint>
- #include <utility>
- 
-@@ -120,7 +121,11 @@ static __global__ void soft_max_f32(
-             break;
-         }
- 
-+#ifdef GGML_DETERMINISTIC
-+        const float val = expf_det(vals[col] - max_val);
-+#else
-         const float val = expf(vals[col] - max_val);
-+#endif
-         tmp += val;
-         vals[col] = val;
-     }
-@@ -144,7 +149,11 @@ static __global__ void soft_max_f32(
-     }
- 
-     if (sinks) {
-+#ifdef GGML_DETERMINISTIC
-+        tmp += expf_det(sinks[i02] - max_val);
-+#else
-         tmp += expf(sinks[i02] - max_val);
-+#endif
-     }
- 
-     const float inv_sum = 1.0f / tmp;
-diff --git a/projects/-home-amiller-installing-ollama/memory/project_nemotron_benchmark.md b/projects/-home-amiller-installing-ollama/memory/project_nemotron_benchmark.md
-new file mode 100644
-index 00000000..c418f876
---- /dev/null
-+++ b/projects/-home-amiller-installing-ollama/memory/project_nemotron_benchmark.md
-@@ -0,0 +1,16 @@
-+---
-+name: Nemotron Cascade 2 benchmark results
-+description: Nemotron Cascade 2 30B-A3B benchmarks on 3090 — 177 tok/s, 512K ctx, 9/10 quality
-+type: project
-+---
-+
-+Nemotron Cascade 2 30B-A3B IQ4_XS benchmarked 2026-03-28:
-+- 177 tok/s generation, 314 tok/s prompt processing
-+- 512K context fits in 22.3GB VRAM (1.8GB free)
-+- 9/10 quality benchmark (failed water jug grep, likely correct answer)
-+- Hybrid Mamba-Transformer + MoE architecture (nemotron_h)
-+- Constant memory per token from Mamba layers → flat speed across context lengths
-+- Added to llama-switch.sh as "nemotron"
-+
-+**Why:** replaces old Nemotron-3 Nano (38 tok/s, removed). 27% faster than qwen3-coder, 8.5x more context, less VRAM.
-+**How to apply:** consider as primary model for long-context agent work. No abliterated GGUF yet (dealignai has JANG/MLX only).
--- 
-2.34.1
-
-
-From 1f7cbbce59ff5bfd682825511fd30fe4f53d00fc Mon Sep 17 00:00:00 2001
-From: Andrew Miller <soc1024@illinois.edu>
-Date: Sun, 29 Mar 2026 18:29:41 -0400
-Subject: [PATCH 5/6] MoE expert parity: fix mul_mat_id src1 indexing bug
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
-
-Found that the GPU deterministic mul_mat_id path indexed src1 with
-e*nb11 for ALL mul_mat_id ops. But src1 has different shapes:
-- Gate/Up projection: src1 = [K, n_tokens] (same input for all experts)
-- Down projection: src1 = [K, n_expert_used, n_tokens] (different per expert)
-
-The fix: use e*nb11 offset only when src1 has >1 column (ne11 > 1).
-Without this, gate/up experts 1-7 read beyond src1 buffer → zero output.
-
-Also adds: F32 det dot product, softmax butterfly + expf_det on GPU,
-per-column mmvq for arbitrary batch sizes.
-
-MoE result: 75/80 tensors match in layer 0 (93.8%).
-Remaining: sum_rows accumulation order for weight normalization.
-
-Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
----
- ggml/src/ggml-cuda/ggml-cuda.cu | 11 ++++++++---
- tools/det-diag/det-diag.cpp     | 15 +++++++++------
- 2 files changed, 17 insertions(+), 9 deletions(-)
-
-diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 6d118337..a9b03443 100644
---- a/ggml/src/ggml-cuda/ggml-cuda.cu
-+++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -2166,7 +2166,9 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
-                 src0_slice.view_src = dst->src[0]; // non-const pointer to src0
-                 src0_slice.data     = (char *) src0->data + ex*nb02;
- 
--                // Slice single input column b[:, e, t]
-+                // Slice single input column b[:, t]
-+                // src1 shape is [K, n_tokens] — same input for all expert slots.
-+                // The 'e' dimension indexes dst output slots, NOT src1 columns.
-                 ggml_tensor src1_slice;
-                 memset(&src1_slice, 0, sizeof(src1_slice));
-                 src1_slice.buffer = src1->buffer;
-@@ -2179,12 +2181,15 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
-                 src1_slice.nb[1]  = src1_slice.ne[0] * src1_slice.nb[0];
-                 src1_slice.nb[2]  = src1_slice.ne[1] * src1_slice.nb[1];
-                 src1_slice.nb[3]  = src1_slice.ne[2] * src1_slice.nb[2];
-+                // src1 may have 1 column (shared input for gate/up) or n_ids columns
-+                // (separate input per expert for down projection)
-+                const int64_t src1_col = (ne11 > 1) ? e : 0;
-                 if (src1->type == GGML_TYPE_F32) {
--                    src1_slice.data = (char *) src1->data + t*nb12 + e*nb11;
-+                    src1_slice.data = (char *) src1->data + t*nb12 + src1_col*nb11;
-                 } else {
-                     // copy typed column to contiguous and convert to F32
-                     const size_t ts = ggml_type_size(src1->type);
--                    const char * src_col = (const char *) src1->data + t*nb12 + e*nb11;
-+                    const char * src_col = (const char *) src1->data + t*nb12 + src1_col*nb11;
-                     CUDA_CHECK(cudaMemcpyAsync(col_typed.get(), src_col, ne10*ts, cudaMemcpyDeviceToDevice, stream));
-                     const to_fp32_cuda_t to_fp32 = ggml_get_to_fp32_cuda(src1->type);
-                     GGML_ASSERT(to_fp32 != nullptr);
-diff --git a/tools/det-diag/det-diag.cpp b/tools/det-diag/det-diag.cpp
-index 28297a98..fb1a4f8d 100644
---- a/tools/det-diag/det-diag.cpp
-+++ b/tools/det-diag/det-diag.cpp
-@@ -47,13 +47,16 @@ static bool tensor_callback(struct ggml_tensor * t, bool ask, void * user_data)
- 
-     // For attention output, dump at token boundaries
-     const char *name = ggml_get_name(t);
--    if (name && strstr(name, "__fattn__") && state->token_idx == 0) {
-+    if (name && (strstr(name, "__fattn__") || strstr(name, "ffn_moe_gate") || strstr(name, "ffn_moe_logits") || strstr(name, "ffn_moe_probs")) && state->token_idx == 0) {
-         printf("  DIMS [%lld,%lld,%lld,%lld]\n", (long long)t->ne[0], (long long)t->ne[1], (long long)t->ne[2], (long long)t->ne[3]);
--        // Dump first 4 floats at each token: offset = token * ne[0] * ne[1]
--        int stride = t->ne[0] * t->ne[1]; // 128*16 = 2048 per token
--        for (int tok = 0; tok < 4 && tok < t->ne[2]; tok++) {
--            int off = tok * stride;
--            printf("  TOK%d@%d", tok, off);
-+        // Dump first 4 floats at each column (expert/token)
-+        int stride = t->ne[0]; // ne[0] per column
-+        int ncols = t->ne[1];
-+        if (ncols > 8) ncols = 8;
-+        for (int col = 0; col < ncols; col++) {
-+            int off = col * stride;
-+            if ((off + 4) * 4 > (int)nbytes) break;
-+            printf("  COL%d@%d", col, off);
-             for (int i = 0; i < 4; i++) {
-                 uint32_t v; memcpy(&v, buf.data() + (off+i)*4, 4);
-                 printf(" %08x", v);
--- 
-2.34.1
-
-
-From 3a52d60c1ff81125f82df73c015d86bc11b4695e Mon Sep 17 00:00:00 2001
-From: Andrew Miller <soc1024@illinois.edu>
-Date: Sun, 29 Mar 2026 18:42:26 -0400
-Subject: [PATCH 6/6] MoE 100% parity: fix sum_rows butterfly + src1 indexing
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
-
-Qwen3-Coder-30B-A3B (Q4_K_M): 5966/5966 tensors match across all 48 layers.
-20/20 tokens match at temp 0.7. Both dense and MoE models verified.
-
-Fixes:
-- sum_rows butterfly reduction matching GPU warp_reduce_sum for ≤32 elements
-- mul_mat_id src1 indexing: only apply expert offset when src1 has >1 column
-  (gate/up share input, down has per-expert input)
-
-Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
----
- ggml/src/ggml-cpu/ops.cpp | 16 +++++++++++++++-
- 1 file changed, 15 insertions(+), 1 deletion(-)
-
-diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
-index ba4f88f1..84f9e0d9 100644
---- a/ggml/src/ggml-cpu/ops.cpp
-+++ b/ggml/src/ggml-cpu/ops.cpp
-@@ -2200,7 +2200,21 @@ static void ggml_compute_forward_sum_rows_f32(
-                 float * src_row = (float *) ((char *) src0->data + i1*nb01 + i2*nb02 + i3*nb03);
-                 float * dst_row = (float *) ((char *) dst->data  + i1*nb1  + i2*nb2  + i3*nb3);
-                 float row_sum = 0;
--                ggml_vec_sum_f32(ne00, &row_sum, src_row);
-+                if (ggml_is_deterministic() && ne00 <= 32) {
-+                    // GPU uses warp butterfly reduction — match it for small rows
-+                    float buf[2][32];
-+                    for (int i = 0; i < 32; i++) buf[0][i] = (i < ne00) ? src_row[i] : 0.0f;
-+                    int cur = 0;
-+                    for (int off = 16; off > 0; off >>= 1) {
-+                        int nxt = 1 - cur;
-+                        for (int lane = 0; lane < 32; lane++)
-+                            buf[nxt][lane] = buf[cur][lane] + buf[cur][lane ^ off];
-+                        cur = nxt;
-+                    }
-+                    row_sum = buf[cur][0];
-+                } else {
-+                    ggml_vec_sum_f32(ne00, &row_sum, src_row);
-+                }
-                 dst_row[0] = row_sum;
-             }
-         }
 -- 
 2.34.1
 
