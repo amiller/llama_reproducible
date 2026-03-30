@@ -25,8 +25,8 @@ echo "Temp:   $TEMP"
 echo "Prompt: \"$PROMPT\""
 echo ""
 
-"$DIAG" -m "$MODEL" -p "$PROMPT" -n "$N" \
-    --seed "$SEED" --temp "$TEMP" --deterministic \
+GGML_DETERMINISTIC=1 "$DIAG" -m "$MODEL" -p "$PROMPT" -n "$N" \
+    --seed "$SEED" --temp "$TEMP" \
     2>&1 >/dev/null | grep "^Token" | \
     sed "s/Token [0-9]*: id=[0-9]* '//" | sed "s/'$//" | tr -d '\n'
 echo
