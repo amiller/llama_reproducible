@@ -2,7 +2,7 @@
 # Build the CPU deterministic verifier from source (no Docker needed)
 set -euo pipefail
 
-LLAMACPP_COMMIT="7c2036704831dc0363a0cafc6bbb85a6d67c1d90"
+LLAMACPP_COMMIT="7c203670f8d746382247ed369fea7fbf10df8ae0"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 if [ ! -d "$SCRIPT_DIR/llama.cpp" ]; then
