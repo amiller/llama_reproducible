@@ -73,10 +73,9 @@ Model: [`qwen2.5-3b-instruct-q4_k_m.gguf`](https://huggingface.co/Qwen/Qwen2.5-3
 
 | Seed | Output |
 |------|--------|
-| 2024 | ", a little mouse used to go to the cinema every Saturday. But when the pandemic hit, the cinema was closed." |
-| 42 | ", there was a boy named Ivan. Ivan loved to play in a forest and explore new places." |
-| 777 | ", there was a king who had a problem. He had a very powerful, but unfaithful, minister" |
-| 9999 | ", a king decided to build a tower of blocks. Each block was of the same size." |
+| 2024 | ", a boy went for a trip. He saw a lot of nice things to buy, but he" |
+| 42 | ", there was a boy named Jack. Jack loved to play in his backyard with his friends." |
+| 777 | ", there was a king who had a magic lamp. The lamp had three wishes, but it was" |
 
 Pick a seed, run it on any modern x86 laptop. Same text comes out.
 

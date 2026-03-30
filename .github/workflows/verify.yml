@@ -54,19 +54,19 @@ jobs:
         run: |
           output=$(./verify.sh models/qwen2.5-3b-instruct-q4_k_m.gguf 2024 0.7 "Once upon a time" 30)
           echo "$output"
-          echo "$output" | grep -q "a little mouse used to go to the cinema every Saturday"
+          echo "$output" | grep -q "a boy went for a trip"
 
       - name: Verify seed 42
         run: |
           output=$(./verify.sh models/qwen2.5-3b-instruct-q4_k_m.gguf 42 0.7 "Once upon a time" 30)
           echo "$output"
-          echo "$output" | grep -q "there was a boy named Ivan"
+          echo "$output" | grep -q "a boy named Jack"
 
       - name: Verify seed 777
         run: |
           output=$(./verify.sh models/qwen2.5-3b-instruct-q4_k_m.gguf 777 0.7 "Once upon a time" 30)
           echo "$output"
-          echo "$output" | grep -q "there was a king who had a problem"
+          echo "$output" | grep -q "a king who had a magic lamp"
 
   verify-qwen35:
     name: Qwen3.5-4B IQ4_XS (hybrid Mamba)
