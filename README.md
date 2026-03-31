@@ -79,6 +79,16 @@ Model: [`qwen2.5-3b-instruct-q4_k_m.gguf`](https://huggingface.co/Qwen/Qwen2.5-3
 
 Pick a seed, run it on any modern x86 laptop. Same text comes out.
 
+## Current status
+
+Works end-to-end but **shelved for daily use** — deterministic mode forces matmul
+through mmvq-4col (no tensor cores), dropping 27B prefill from ~1385 tok/s to
+129 tok/s. Generation speed is unaffected. A dp4a MMQ kernel was written that's
+5× faster for small models (3B: 642 tok/s) but slower than mmvq for 27B (86 vs
+129 tok/s). The dp4a code is preserved in the patch for future optimization.
+
+See `tools/det-diag/README.md` in the patched llama.cpp for detailed project status.
+
 ## What's inside
 
 ```
@@ -97,7 +107,8 @@ llama.cpp already has a [`--deterministic` mode](https://github.com/ggml-org/lla
 
 ## Design constraints
 
-- **GPU stays fast.** We don't cripple the GPU kernel. Most fixes are on the CPU side, making it emulate the GPU's arithmetic. The few GPU-side changes (`__frsqrt_rn` instead of approximate `rsqrtf`, portable `expf_det` in SiLU, sequential `sum_rows`/`solve_tri` kernels) cost ~3-5% overhead.
+- **GPU stays fast (for generation).** Most fixes are on the CPU side, making it emulate the GPU's arithmetic. The few GPU-side changes (`__frsqrt_rn` instead of approximate `rsqrtf`, portable `expf_det` in SiLU, sequential `sum_rows`/`solve_tri` kernels) cost ~0% overhead on SM86 for generation. Prefill is 10× slower because matmul must avoid tensor cores (MMA) for CPU parity.
+- **Unified build.** Single binary with runtime `GGML_DETERMINISTIC=1` toggle — no separate det/stock builds needed.
 - **Specific environment.** We targeted one setup: **RTX 3090 (SM86) + CUDA 12.8**. Different GPUs or CUDA versions may produce different reference outputs — the JIT compiler generates different machine code per architecture. Extending to other GPUs means re-verifying (and possibly re-tuning) the CPU shadow.
 - **Two quant formats.** Verified for Q4_K_M and IQ4_XS (with Q8_0 and Q5_K sub-tensors). Other formats have deterministic dot products written but need end-to-end testing.
 - **Multi-core safe.** The CPU verifier runs on all cores by default. Each deterministic operation uses a fixed reduction order per output element, so results are identical regardless of thread count.
